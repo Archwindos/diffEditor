@@ -46,10 +46,15 @@ export interface ReviewStatus {
   lifecycle?: 'open' | 'closed' | 'deleted';
 }
 export interface StatusResponse { reviews: ReviewStatus[]; }
+export interface WaitRequest { reviewIds: string[]; timeoutMs: number; }
+export interface WaitResponse extends StatusResponse { reason: 'saved' | 'attention' | 'timeout'; }
+export const DEFAULT_WAIT_MS = 30 * 60 * 1000;
+export const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 export type CliRequest =
   | { command: 'baseline'; payload: BaselineRequest }
   | { command: 'submit'; payload: SubmitRequest }
-  | { command: 'status'; payload: { reviewId?: string } };
+  | { command: 'status'; payload: { reviewId?: string } }
+  | { command: 'wait'; payload: WaitRequest };
 export type WireReply = { ok: true; result: unknown } | { ok: false; error: string; code?: string };
 export interface AppSettings { closeToTray: boolean; }
 export interface DesktopAPI {

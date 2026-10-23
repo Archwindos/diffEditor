@@ -144,7 +144,7 @@ function handlers() {
     const target = review.targets.find(item => item.id === review[request.side].targetId);
     if (!target || (review.mode === 'text' && !target.exists && target.status === 'pending')) {
       const choice = await dialog.showSaveDialog(win!, { title: '将文本保存为新文件',
-        defaultPath: target?.path || (request.side === 'left' ? '左侧文本.txt' : '右侧文本.txt'),
+        defaultPath: target?.path || (request.side === 'left' ? '原稿.txt' : '新稿.txt'),
         buttonLabel: '选择保存位置',
         filters: [{ name: '文本文件', extensions: ['txt'] }, { name: 'Markdown', extensions: ['md'] }, { name: 'LaTeX', extensions: ['tex'] }, { name: '所有文件', extensions: ['*'] }] });
       if (choice.canceled || !choice.filePath) return null;

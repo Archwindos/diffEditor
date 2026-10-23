@@ -67,6 +67,10 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   assert.equal(pending.value.reviews[0].targets[0].status, 'pending');
   assert.equal(store.list().reviews[0].right.text, candidate.files[0].text);
   assert.deepEqual(await fs.readFile(target), original);
+  const timedOut = await invoke(['wait', reviewId, '--timeout', '1']);
+  assert.equal(timedOut.code, 0); assert.equal(timedOut.value.reason, 'timeout');
+  assert.equal(timedOut.value.reviews[0].targets[0].receipt, undefined);
+  assert.deepEqual(await fs.readFile(target), original);
   // Direct store lifecycle operations stand in for a user's choices, isolated from the real app.
   await store.setReviewClosed(reviewId, true);
   const closed = await invoke(['status', reviewId]);
@@ -75,6 +79,9 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   await store.deleteReview(reviewId);
   const deleted = await invoke(['status', reviewId]);
   assert.equal(deleted.code, 0); assert.equal(deleted.value.reviews[0].lifecycle, 'deleted');
+  const attention = await invoke(['wait', reviewId, '--timeout', '1']);
+  assert.equal(attention.code, 0); assert.equal(attention.value.reason, 'attention');
+  assert.equal(attention.value.reviews[0].lifecycle, 'deleted');
   const duplicate = await invoke(['submit', '--file', candidatePath]);
   assert.equal(duplicate.code, 0); assert.deepEqual(duplicate.value, { reviewIds: [reviewId], duplicate: true });
   assert.equal(store.list().reviews.length, 0); assert.equal(store.status(reviewId).reviews[0].lifecycle, 'deleted');
@@ -85,4 +92,30 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   assert.equal(submissions, 2); assert.deepEqual(await fs.readFile(target), original);
   assert.deepEqual(await fs.readFile(candidatePath), candidateBytes);
   await assert.rejects(fs.stat(path.join(root, '.diffeditor-backups')), { code: 'ENOENT' });
+
+  // A second isolated sample lets the helper observe a real user-style save.
+  const savedPath = path.join(root, 'wait sample.txt'); await fs.writeFile(savedPath, 'before\r\n', { flag: 'wx' });
+  const savedBaseline = await invoke(['baseline', savedPath]);
+  const savedCandidatePath = path.join(root, 'wait candidate.json');
+  await fs.writeFile(savedCandidatePath, JSON.stringify({ requestId: randomUUID(), files: [{ baselineId: savedBaseline.value.files[0].id, text: 'AI version' }] }), { flag: 'wx' });
+  const savedSubmission = await invoke(['submit', '--file', savedCandidatePath]);
+  const savedId = savedSubmission.value.reviewIds[0];
+  let observed!: () => void;
+  const subscribed = new Promise<void>(resolve => { observed = resolve; });
+  const subscribe = store.onDidChange.bind(store);
+  store.onDidChange = listener => { const dispose = subscribe(listener); observed(); return dispose; };
+  const waiting = invoke(['wait', savedId, '--timeout', '2']);
+  await subscribed;
+  await store.updateDraft({ reviewId: savedId, side: 'left', text: 'user edited choice\n', expectedRevision: 0 });
+  const preview = await store.prepareSave({ reviewId: savedId, side: 'left', expectedRevision: 1 });
+  const receipt = await store.commitSave(preview.token);
+  const saved = await waiting;
+  assert.equal(saved.code, 0); assert.equal(saved.stderr, ''); assert.equal(saved.value.reason, 'saved');
+  assert.deepEqual(saved.value.reviews[0].targets[0].receipt, receipt);
+  assert.equal(receipt.side, 'left');
+  assert.equal(await fs.readFile(savedPath, 'utf8'), 'user edited choice\r\n');
+  assert.equal(await fs.readFile(receipt.backupPath!, 'utf8'), 'before\r\n');
+  const replay = await invoke(['wait', savedId, '--timeout', '1']);
+  assert.deepEqual(replay.value, saved.value);
+  assert.equal(submissions, 3);
 });

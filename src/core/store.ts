@@ -30,11 +30,16 @@ export class ReviewStore {
   private state: State = fresh();
   private queue: Promise<unknown> = Promise.resolve();
   private readonly statePath: string;
+  private readonly changeListeners = new Set<() => void>();
   constructor(private readonly options: { dataDir: string; onChange?: () => void; failpoint?: (point: Failpoint) => void | Promise<void> }) {
     this.statePath = path.join(options.dataDir, 'state.json');
   }
   private serial<T>(work: () => Promise<T>): Promise<T> {
     const result = this.queue.then(work).catch(error => { throw new Error(errorMessage(error)); }); this.queue = result.catch(() => undefined); return result;
+  }
+  onDidChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => { this.changeListeners.delete(listener); };
   }
   private async persist(state: State) {
     await fs.mkdir(this.options.dataDir, { recursive: true });
@@ -46,6 +51,9 @@ export class ReviewStore {
     } finally { await fs.unlink(temporary).catch(() => undefined); }
     this.state = copy(state);
     try { this.options.onChange?.(); } catch { /* UI notification cannot undo a persisted operation. */ }
+    for (const listener of this.changeListeners) {
+      try { listener(); } catch { /* Observers cannot undo a persisted operation. */ }
+    }
   }
   async init() {
     return this.serial(async () => {

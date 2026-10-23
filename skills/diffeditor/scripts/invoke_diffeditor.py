@@ -8,8 +8,8 @@ import sys
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("baseline", "submit", "status"):
-        raise ValueError("Only baseline, submit, and status are supported; no CLI save or approval exists.")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("baseline", "submit", "status", "wait"):
+        raise ValueError("Only baseline, submit, status, and wait are supported; no CLI save or approval exists.")
     explicit = os.environ.get("DIFFEDITOR_HOME")
     roots = [Path(explicit)] if explicit else [Path(__file__).resolve().parents[3], Path(r"D:\Project\diffEditor")]
     for root in roots:

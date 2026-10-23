@@ -2,11 +2,13 @@ import net from 'node:net';
 import { MAX_MESSAGE_BYTES } from '../shared/transport';
 import type { BaselineRequest, SubmitRequest, TextEncoding, WireReply } from '../shared/contracts';
 import type { ReviewStore } from '../core/store';
+import { validateWaitRequest, waitForReviews } from './wait';
 const encodings: TextEncoding[] = ['utf8', 'utf16le', 'utf16be', 'gb18030'];
 export function failure(error: unknown): WireReply {
   return { ok: false, error: error instanceof Error ? error.message : String(error) };
 }
-export async function handleCli(store: ReviewStore, request: unknown, onSubmit: () => void): Promise<WireReply> {
+export async function handleCli(store: ReviewStore, request: unknown, onSubmit: () => void,
+  waiting?: { signal: AbortSignal; onWait: () => void }): Promise<WireReply> {
   try {
     if (!request || typeof request !== 'object') throw new Error('请求必须为 JSON 对象');
     const { command, payload } = request as { command?: unknown; payload?: unknown };
@@ -29,11 +31,18 @@ export async function handleCli(store: ReviewStore, request: unknown, onSubmit: 
       if (p.reviewId !== undefined && typeof p.reviewId !== 'string') throw new Error('reviewId 必须为文本');
       return { ok: true, result: store.status(p.reviewId as string | undefined) };
     }
-    throw new Error('CLI 仅支持 baseline、submit、status；保存必须在桌面窗口中确认');
+    if (command === 'wait') {
+      const input = validateWaitRequest(p);
+      waiting?.onWait();
+      return { ok: true, result: await waitForReviews(store, input, waiting?.signal) };
+    }
+    throw new Error('CLI 仅支持 baseline、submit、status、wait；保存必须在桌面窗口中确认');
   } catch (error) { return failure(error); }
 }
 export function createPipeServer(store: ReviewStore, onSubmit: () => void): net.Server {
   return net.createServer(socket => {
+    const abort = new AbortController();
+    socket.once('close', () => abort.abort());
     let bytes = 0;
     const chunks: Buffer[] = [];
     let done = false;
@@ -53,7 +62,11 @@ export function createPipeServer(store: ReviewStore, onSubmit: () => void): net.
       const line = Buffer.concat(chunks).toString('utf8').split('\n')[0];
       (async () => {
         let reply: WireReply;
-        try { reply = await handleCli(store, JSON.parse(line), onSubmit); }
+        try { reply = await handleCli(store, JSON.parse(line), onSubmit, {
+          signal: abort.signal,
+          // Validated waits have their own bounded review deadline.
+          onWait: () => socket.setTimeout(0),
+        }); }
         catch (error) { reply = failure(error); }
         if (!socket.destroyed) socket.end(JSON.stringify(reply) + '\n');
       })();

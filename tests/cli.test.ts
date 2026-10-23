@@ -103,7 +103,12 @@ test('UTF-8 JSON file submission and duplicate receipts are returned without rew
     assert.equal(result.code, 0);
     assert.equal(result.value.duplicate, true);
     assert.equal(await fs.readFile(input, 'utf8'), JSON.stringify(payload));
-  } finally { await fixture.close(); await fs.rm(directory, { recursive: true }); }
+  } finally {
+    await fixture.close();
+    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('diffeditor-cli-'));
+    await fs.rm(directory, { recursive: true });
+  }
 });
 
 test('invalid input fails locally and cannot inject a different command', async () => {
@@ -174,4 +179,32 @@ test('size and argument limits are enforced before connecting', async () => {
   assert.throws(() => parseArgs(['baseline', 'file', '--encoding', 'latin1']), /encoding/);
   assert.throws(() => parseSubmission(Buffer.from(JSON.stringify({ requestId: 'x', files: [{ baselineId: 'x', text: '' }, { baselineId: 'x', text: '' }] }))), /repeated/);
   await assert.rejects(sendRequest({ command: 'submit', payload: { requestId: 'x', files: [{ baselineId: 'x', text: 'x'.repeat(MAX_MESSAGE_BYTES) }] } }), /limit/);
+});
+
+test('wait parses unique review IDs and bounded seconds without approval options', () => {
+  assert.deepEqual(parseArgs(['wait', 'first', 'second']).request,
+    { command: 'wait', payload: { reviewIds: ['first', 'second'], timeoutMs: 1800000 } });
+  assert.deepEqual(parseArgs(['wait', 'first', '--timeout', '86400', 'second']).request,
+    { command: 'wait', payload: { reviewIds: ['first', 'second'], timeoutMs: 86400000 } });
+  for (const args of [
+    ['wait'], ['wait', ''], ['wait', ' '], ['wait', 'r1', 'r1'],
+    ['wait', 'r1', '--approve'], ['wait', 'r1', '--timeout'],
+    ...['0', '-1', '1.5', '86401', 'NaN', 'Infinity'].map(value => ['wait', 'r1', '--timeout', value]),
+    ['wait', 'r1', '--timeout', '1', '--timeout', '2'],
+  ]) assert.throws(() => parseArgs(args), error => (error as { code: string }).code === 'ARGUMENT_ERROR');
+});
+
+test('wait has its own response deadline and all three outcomes exit successfully without replay', async () => {
+  for (const reason of ['saved', 'attention', 'timeout']) {
+    const result = { reason, reviews: [{ id: 'first' }, { id: 'second' }] };
+    const fixture = await serverFixture((socket, request) => {
+      assert.deepEqual(request, { command: 'wait', payload: { reviewIds: ['first', 'second'], timeoutMs: 1000 } });
+      setTimeout(() => socket.end(JSON.stringify({ ok: true, result }) + '\n'), 150);
+    });
+    try {
+      const output = await cli(['wait', 'first', 'second', '--timeout', '1'], fixture.pipe, undefined, 50);
+      assert.equal(output.code, 0); assert.equal(output.stderr, ''); assert.deepEqual(output.value, result);
+      assert.equal(fixture.requests(), 1);
+    } finally { await fixture.close(); }
+  }
 });

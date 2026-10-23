@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { TextDecoder } from 'node:util';
 import type { CliRequest, SubmitRequest, TextEncoding, WireReply } from '../shared/contracts';
+import { DEFAULT_WAIT_MS, MAX_WAIT_MS } from '../shared/contracts';
 import { MAX_MESSAGE_BYTES, pipeName } from '../shared/transport';
 import { version } from '../../package.json';
 
@@ -13,7 +14,7 @@ export class CliError extends Error {
 }
 
 const encodings = new Set<TextEncoding>(['utf8', 'utf16le', 'utf16be', 'gb18030']);
-const usage = 'Use baseline <paths...> [--encoding utf8|utf16le|utf16be|gb18030], submit --stdin|--file <json>, or status [reviewId].';
+const usage = 'Use baseline <paths...> [--encoding utf8|utf16le|utf16be|gb18030], submit --stdin|--file <json>, status [reviewId], or wait <reviewIds...> [--timeout seconds].';
 export function parseArgs(args: string[]): { request?: CliRequest; input?: 'stdin' | string } {
   const [command, ...rest] = args;
   if (command === 'baseline') {
@@ -41,6 +42,23 @@ export function parseArgs(args: string[]): { request?: CliRequest; input?: 'stdi
   }
   if (command === 'status' && rest.length <= 1 && !rest[0]?.startsWith('--')) {
     return { request: { command, payload: rest.length ? { reviewId: rest[0] } : {} } };
+  }
+  if (command === 'wait') {
+    const reviewIds: string[] = [];
+    let timeoutMs = DEFAULT_WAIT_MS, hasTimeout = false;
+    for (let i = 0; i < rest.length; i++) {
+      const arg = rest[i];
+      if (arg === '--timeout') {
+        const value = rest[++i];
+        if (hasTimeout || !value || !/^\d+$/.test(value) || Number(value) < 1 || Number(value) > MAX_WAIT_MS / 1000) {
+          throw new CliError('--timeout must be an integer from 1 to 86400 seconds, specified once.', 'ARGUMENT_ERROR');
+        }
+        timeoutMs = Number(value) * 1000; hasTimeout = true;
+      } else if (arg.startsWith('--') || !arg.trim()) throw new CliError(usage, 'ARGUMENT_ERROR');
+      else reviewIds.push(arg);
+    }
+    if (!reviewIds.length || new Set(reviewIds).size !== reviewIds.length) throw new CliError('wait needs one or more unique review IDs.', 'ARGUMENT_ERROR');
+    return { request: { command, payload: { reviewIds, timeoutMs } } };
   }
   throw new CliError(`Unsupported command or arguments. ${usage}`, 'ARGUMENT_ERROR');
 }
@@ -185,7 +203,8 @@ export async function sendRequest(request: CliRequest, timeoutMs = 20_000): Prom
       socket.destroy();
       if (error) reject(error); else resolve(result);
     };
-    const timer = setTimeout(() => finish(new CliError('Timed out waiting for DiffEditor response; operation outcome is unknown. Query status before retrying.', 'TIMEOUT')), Math.max(1, deadline - Date.now()));
+    const responseTimeout = request.command === 'wait' ? request.payload.timeoutMs + timeoutMs : Math.max(1, deadline - Date.now());
+    const timer = setTimeout(() => finish(new CliError('Timed out waiting for DiffEditor response; operation outcome is unknown. Query status before retrying.', 'TIMEOUT')), responseTimeout);
     socket.on('error', error => finish(error));
     socket.on('end', () => finish(new CliError('Connection closed before a complete response; operation outcome is unknown.', 'INCOMPLETE_RESPONSE')));
     socket.on('data', (chunk: Buffer) => {

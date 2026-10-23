@@ -16,6 +16,7 @@ import type { ReviewView, Side, SavePreview, TextEncoding, TargetView } from '..
 import { replaceChunk } from './chunks';
 import { hasOtherUnfinishedFile, retainedReceiptFor } from './retained';
 import { Settings } from './Settings';
+import { TextOverview } from './TextOverview';
 import './styles.css';
 
 (self as typeof self & { MonacoEnvironment: monaco.Environment }).MonacoEnvironment = { getWorker: () => new EditorWorker() };
@@ -23,7 +24,8 @@ monaco.editor.defineTheme('review-light', {
   base: 'vs', inherit: true, rules: [], colors: {
     'editor.background': '#ffffff', 'editor.foreground': '#25303a',
     'editorLineNumber.foreground': '#a0a7ae', 'editorLineNumber.activeForeground': '#4c5966',
-    'editor.lineHighlightBackground': '#f7f9fa', 'editor.selectionBackground': '#dce8f3',
+    'editor.lineHighlightBackground': '#f7f9fa', 'editor.selectionBackground': '#4b9be866',
+    'editor.inactiveSelectionBackground': '#4b9be84d',
     'diffEditor.insertedTextBackground': '#a9dfb762', 'diffEditor.removedTextBackground': '#f3b5b75c',
     'diffEditor.insertedLineBackground': '#eff8f0', 'diffEditor.removedLineBackground': '#fff0f0',
     'diffEditor.diagonalFill': '#eef1f3', 'editorGutter.background': '#ffffff',
@@ -33,7 +35,8 @@ monaco.editor.defineTheme('review-light', {
 type Draft = { text: string; persisted: string; revision: number; state: 'cached' | 'caching' | 'error'; error?: string; queue: Promise<void>; timer?: ReturnType<typeof setTimeout>; inFlight: boolean };
 type FrozenPreview = { preview: SavePreview; text: string };
 const sides: Side[] = ['left', 'right'];
-const labels: Record<Side, string> = { left: '左侧', right: '右侧' };
+const labels: Record<Side, string> = { left: '原稿（左）', right: '新稿（右）' };
+const versionNames: Record<Side, string> = { left: '原稿', right: '新稿' };
 const encodings: Record<TextEncoding, string> = { utf8: 'UTF-8', utf16le: 'UTF-16 LE', utf16be: 'UTF-16 BE', gb18030: 'GB18030' };
 const statusLabels: Record<string, string> = { pending: '待审核', saving: '正在保存', saved: '已正式保存', conflict: '文件有冲突', error: '保存失败', rejected: '已退回' };
 const errorText = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -101,7 +104,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<FrozenPreview>();
   const [changes, setChanges] = useState<monaco.editor.ILineChange[]>([]);
-  const [chunkPositions, setChunkPositions] = useState<number[]>([]);
+  const [chunkPositions, setChunkPositions] = useState<{ top: number; bottom: number }[]>([]);
+  const [hoveredChunk, setHoveredChunk] = useState<{ index: number; to: Side }>();
   const [currentChunk, setCurrentChunk] = useState(-1);
   const [dragging, setDragging] = useState(false);
   const [rejecting, setRejecting] = useState(false);
@@ -286,7 +290,7 @@ function App() {
     left.setEOL(monaco.editor.EndOfLineSequence.LF); right.setEOL(monaco.editor.EndOfLineSequence.LF);
     models.current = { left, right };
     const options: monaco.editor.IStandaloneEditorConstructionOptions = {
-      theme: 'review-light', automaticLayout: true,
+      theme: 'review-light', automaticLayout: true, roundedSelection: false,
       fontFamily: "'Cascadia Code', Consolas, 'Microsoft YaHei UI', monospace", fontSize: 13, lineHeight: 22,
       minimap: { enabled: false }, scrollBeyondLastLine: false, wordWrap: wrap ? 'on' : 'off',
       padding: { top: 14, bottom: 16 }, lineNumbersMinChars: 4, glyphMargin: false,
@@ -294,9 +298,9 @@ function App() {
       scrollbar: { verticalScrollbarSize: 6, horizontalScrollbarSize: 6, verticalSliderSize: 6, horizontalSliderSize: 6, useShadows: false },
     };
     const disposables = [left.onDidChangeContent(() => edit('left', left.getValue())), right.onDidChangeContent(() => edit('right', right.getValue()))];
-    setCurrentChunk(-1); setChanges([]); setChunkPositions([]); setSaveEncoding({}); setRejecting(false);
+    setCurrentChunk(-1); setChanges([]); setChunkPositions([]); setHoveredChunk(undefined); setSaveEncoding({}); setRejecting(false);
     if (retainedSide) {
-      const editor = monaco.editor.create(editorHost.current, { ...options, model: models.current[retainedSide], readOnly: true });
+      const editor = monaco.editor.create(editorHost.current, { ...options, model: models.current[retainedSide], readOnly: true, scrollbar: { ...options.scrollbar, vertical: 'hidden', verticalScrollbarSize: 0 } });
       retainedEditorRef.current = editor;
       editor.getDomNode()?.setAttribute('data-testid', 'editor-retained');
       editor.getDomNode()?.setAttribute('data-side', retainedSide);
@@ -312,19 +316,29 @@ function App() {
       diffAlgorithm: 'advanced', maxComputationTime: 0, renderOverviewRuler: false, diffWordWrap: wrap ? 'on' : 'off',
     });
     diff.setModel({ original: left, modified: right }); diffRef.current = diff;
+    diff.getModifiedEditor().updateOptions({ scrollbar: { vertical: 'hidden', verticalScrollbarSize: 0 } });
     diff.getOriginalEditor().getDomNode()?.setAttribute('data-testid', 'editor-left');
     diff.getModifiedEditor().getDomNode()?.setAttribute('data-testid', 'editor-right');
     const positionChunks = () => {
       const next = diff.getLineChanges() || [];
-      const ed = diff.getModifiedEditor();
-      setChunkPositions(next.map(c => ed.getTopForLineNumber(Math.max(1, c.modifiedStartLineNumber)) - ed.getScrollTop()));
+      const original = diff.getOriginalEditor(), modified = diff.getModifiedEditor();
+      setChunkPositions(next.map(c => {
+        const source = c.originalEndLineNumber ? original : modified;
+        const start = c.originalEndLineNumber ? c.originalStartLineNumber : c.modifiedStartLineNumber;
+        const end = c.originalEndLineNumber ? c.originalEndLineNumber : c.modifiedEndLineNumber;
+        const top = source.getTopForLineNumber(Math.max(1, start)) - source.getScrollTop();
+        const bottom = source.getBottomForLineNumber(Math.max(1, end)) - source.getScrollTop();
+        const modifiedBottom = c.modifiedEndLineNumber ? modified.getBottomForLineNumber(c.modifiedEndLineNumber) - modified.getScrollTop() : bottom;
+        return { top, bottom: Math.max(bottom, modifiedBottom, top + 22) };
+      }));
     };
     disposables.push(
       trackScrollActivity(diff.getOriginalEditor()),
       trackScrollActivity(diff.getModifiedEditor()),
       diff.getOriginalEditor().onDidFocusEditorText(() => setFocusSide('left')),
       diff.getModifiedEditor().onDidFocusEditorText(() => setFocusSide('right')),
-      diff.onDidUpdateDiff(() => { const next = diff.getLineChanges() || []; setChanges(next); setCurrentChunk(i => Math.min(i, next.length - 1)); positionChunks(); }),
+      diff.onDidUpdateDiff(() => { const next = diff.getLineChanges() || []; setChanges(next); setHoveredChunk(undefined); setCurrentChunk(i => Math.min(i, next.length - 1)); positionChunks(); }),
+      diff.getOriginalEditor().onDidScrollChange(positionChunks),
       diff.getModifiedEditor().onDidScrollChange(positionChunks),
       diff.getModifiedEditor().onDidLayoutChange(positionChunks),
     );
@@ -357,7 +371,7 @@ function App() {
     diffRef.current?.getOriginalEditor().revealLineInCenter(Math.max(1, c.originalStartLineNumber));
   };
   const transfer = (index: number, from: Side) => {
-    if (!review || !models.current || blocked || retainedSide) return;
+    if (!review || !models.current || blocked || retainedSide || !changes[index]) return;
     const to: Side = from === 'left' ? 'right' : 'left';
     if (locked(targetFor(review, to))) return;
     const model = models.current[to];
@@ -372,6 +386,23 @@ function App() {
     ed?.focus();
     if (id === 'undo' || id === 'redo') ed?.trigger('toolbar', id, null);
     else void ed?.getAction(id)?.run();
+  };
+  const hoverChunk = (event: React.PointerEvent<HTMLDivElement>) => {
+    // Text selection owns the pointer while dragging; don't flash transfer controls over it.
+    if (retainedSide || blocked || event.buttons !== 0 || !diffRef.current) { setHoveredChunk(undefined); return; }
+    const target = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('[data-chunk-index]') : null;
+    if (target) {
+      const next = { index: Number(target.dataset.chunkIndex), to: target.dataset.to as Side };
+      setHoveredChunk(current => current?.index === next.index && current.to === next.to ? current : next);
+      return;
+    }
+    const stage = event.currentTarget.getBoundingClientRect();
+    if (event.clientX >= stage.right - 40) { setHoveredChunk(undefined); return; }
+    const y = event.clientY - stage.top;
+    const index = chunkPositions.findIndex(chunk => y >= chunk.top && y < chunk.bottom);
+    if (index < 0) { setHoveredChunk(undefined); return; }
+    const to: Side = event.clientX < stage.left + (stage.width - 40) / 2 ? 'left' : 'right';
+    setHoveredChunk(current => current?.index === index && current.to === to ? current : { index, to });
   };
   const drop = (event: React.DragEvent, mode: 'single' | 'pair') => {
     event.preventDefault(); event.stopPropagation(); setDragging(false);
@@ -409,19 +440,27 @@ function App() {
       {review ? <>
         <div className={`pane-headers ${retainedSide ? 'retained-view' : ''}`} data-testid={retainedSide ? 'retained-view' : 'comparison-view'}>{(retainedSide ? [retainedSide] : sides).map(side => {
           const target = targetFor(review, side), draft = drafts.current.get(keyFor(review.id, side));
+          const aiDraft = review.mode === 'proposal' && side === 'right' && target?.status !== 'saved';
+          const pathText = target ? (aiDraft ? `AI 提供的草稿，确认后保存至：${target.path}` : target.path) : '保存时选择文件位置';
           const lineCount = models.current?.[side].getLineCount() ?? draft?.text.split('\n').length ?? 0;
           const changedLines = changes.reduce((total, change) => {
             const start = side === 'left' ? change.originalStartLineNumber : change.modifiedStartLineNumber;
             const end = side === 'left' ? change.originalEndLineNumber : change.modifiedEndLineNumber;
             return total + (end === 0 ? 0 : end - start + 1);
           }, 0);
-          return <section key={side} className={`pane-header ${focusSide === side ? 'focused' : ''}`}><div className="pane-heading"><span className="side-label">{labels[side]}</span><strong title={target?.path}>{target ? basename(target.path) : `${labels[side]}文本`}</strong><span className={`formal-state ${target?.status || 'pending'}`}>{target ? statusLabels[target.status] : '未关联文件'}</span></div><div className="pane-path" title={target?.path}>{target?.path || '保存时选择文件位置'}</div><div className="pane-controls"><span data-testid={`draft-status-${side}`} className={`draft-status ${draft?.state}`}>{draft?.state === 'caching' ? '草稿缓存中…' : draft?.state === 'error' ? '草稿缓存失败' : '草稿已缓存'}</span><span className="pane-metrics"><span data-testid={`line-count-${side}`}>{lineCount.toLocaleString()} 行</span><span data-testid={`change-count-${side}`} className={side === 'left' ? 'deleted' : 'added'}>{side === 'left' ? '−' : '+'}{changedLines.toLocaleString()} 行</span></span>{draft?.state === 'error' && <button className="text-button" onClick={() => void action(() => flushPane(review.id, side))}>重试</button>}<div className="pane-save"><select data-testid={`save-encoding-${side}`} aria-label={`${labels[side]}保存编码`} disabled={blocked || !canSave(target)} value={saveEncoding[side] || target?.encoding || 'utf8'} onChange={e => setSaveEncoding(current => ({ ...current, [side]: e.target.value as TextEncoding }))}>{Object.entries(encodings).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><button data-testid={`save-${side}`} className="save-button" disabled={blocked || !canSave(target)} onClick={() => void saveSide(side)}>{isUncreatedText(review, target) ? '另存为…' : '保存此侧'}</button></div></div>{(draft?.error || target?.error) && <div className="pane-error" role="alert">{draft?.error || target?.error}</div>}{target?.receipt && <div className="receipt">已保存 {new Date(target.receipt.savedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}{target.receipt.backupPath && <button className="text-button" onClick={() => void action(async () => { await window.diffEditor.showInFolder(target.receipt!.backupPath!); })}>查看备份</button>}<button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>继续编辑</button></div>}{(target?.status === 'conflict' || target?.status === 'error') && <div className="recovery"><span>当前草稿已保留，重新读取磁盘文件后继续审核。</span><button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>基于磁盘继续</button></div>}</section>;
+          return <section key={side} className={`pane-header ${focusSide === side ? 'focused' : ''}`}><div className="pane-heading"><span className="side-label">{labels[side]}</span><strong title={target?.path}>{target ? basename(target.path) : `${versionNames[side]}文本`}</strong><span className={`formal-state ${target?.status || 'pending'}`}>{target ? statusLabels[target.status] : '未关联文件'}</span></div><div className={`pane-path ${aiDraft ? 'ai-draft-path' : ''}`} data-testid={`pane-path-${side}`} title={pathText}>{pathText}</div><div className="pane-controls"><span data-testid={`draft-status-${side}`} className={`draft-status ${draft?.state}`}>{draft?.state === 'caching' ? '草稿缓存中…' : draft?.state === 'error' ? '草稿缓存失败' : '草稿已缓存'}</span><span className="pane-metrics"><span data-testid={`line-count-${side}`}>{lineCount.toLocaleString()} 行</span><span data-testid={`change-count-${side}`} className={side === 'left' ? 'deleted' : 'added'}>{side === 'left' ? '−' : '+'}{changedLines.toLocaleString()} 行</span></span>{draft?.state === 'error' && <button className="text-button" onClick={() => void action(() => flushPane(review.id, side))}>重试</button>}<div className="pane-save"><select data-testid={`save-encoding-${side}`} aria-label={`${labels[side]}保存编码`} disabled={blocked || !canSave(target)} value={saveEncoding[side] || target?.encoding || 'utf8'} onChange={e => setSaveEncoding(current => ({ ...current, [side]: e.target.value as TextEncoding }))}>{Object.entries(encodings).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><button data-testid={`save-${side}`} className="save-button" disabled={blocked || !canSave(target)} onClick={() => void saveSide(side)}>{isUncreatedText(review, target) ? '另存为…' : `保存${versionNames[side]}`}</button></div></div>{(draft?.error || target?.error) && <div className="pane-error" role="alert">{draft?.error || target?.error}</div>}{target?.receipt && <div className="receipt">已保存 {new Date(target.receipt.savedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}{target.receipt.backupPath && <button className="text-button" onClick={() => void action(async () => { await window.diffEditor.showInFolder(target.receipt!.backupPath!); })}>查看备份</button>}<button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>继续编辑</button></div>}{(target?.status === 'conflict' || target?.status === 'error') && <div className="recovery"><span>当前草稿已保留，重新读取磁盘文件后继续审核。</span><button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>基于磁盘继续</button></div>}</section>;
         })}</div>
-        <div className="editor-stage" data-testid="editor-stage"><div className="editor-host" data-testid={retainedSide ? 'retained-editor' : 'diff-editor'} ref={editorHost} />{!retainedSide && <div className="chunk-rail" aria-label="逐块替换">{changes.map((_, index) => <div key={index} className={`chunk-actions ${currentChunk === index ? 'current' : ''}`} style={{ top: chunkPositions[index] ?? -1000 }}><button data-testid={`chunk-to-left-${index}`} aria-label={`第 ${index + 1} 处用右侧替换左侧`} title="用右侧替换左侧此处" disabled={locked(targetFor(review, 'left')) || blocked} onClick={() => transfer(index, 'right')}>←</button><button data-testid={`chunk-to-right-${index}`} aria-label={`第 ${index + 1} 处用左侧替换右侧`} title="用左侧替换右侧此处" disabled={locked(targetFor(review, 'right')) || blocked} onClick={() => transfer(index, 'left')}>→</button></div>)}</div>}</div>
+        <div className="editor-stage" data-testid="editor-stage" onPointerMove={hoverChunk} onPointerDown={e => { if (!(e.target instanceof Element) || !e.target.closest('[data-chunk-index]')) setHoveredChunk(undefined); }} onPointerLeave={() => setHoveredChunk(undefined)} onWheel={() => setHoveredChunk(undefined)}>
+          <div className="editor-host" data-testid={retainedSide ? 'retained-editor' : 'diff-editor'} ref={editorHost} />
+          {!retainedSide && <div className="chunk-rail" aria-label="逐块替换">{changes.map((_, index) => <div key={index} className="chunk-actions" style={{ top: (chunkPositions[index]?.bottom ?? 0) > 0 ? Math.max(0, chunkPositions[index].top) : -1000 }}>
+            {sides.map(to => <button key={to} className={`chunk-action to-${to} ${hoveredChunk?.index === index && hoveredChunk.to === to ? 'is-visible' : ''}`} data-testid={`chunk-to-${to}-${index}`} data-chunk-index={index} data-to={to} aria-label={`第 ${index + 1} 处${to === 'left' ? '用新稿替换原稿' : '用原稿替换新稿'}`} title={to === 'left' ? '用新稿替换原稿此处' : '用原稿替换新稿此处'} disabled={locked(targetFor(review, to)) || blocked} onClick={() => transfer(index, to === 'left' ? 'right' : 'left')}><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={to === 'left' ? 'M19 12H5m5-5-5 5 5 5' : 'M5 12h14m-5-5 5 5-5 5'} /></svg></button>)}
+          </div>)}</div>}
+          <TextOverview diff={diffRef.current} editor={retainedEditorRef.current} changes={changes} originalText={drafts.current.get(keyFor(review.id, 'left'))?.text || ''} modifiedText={drafts.current.get(keyFor(review.id, 'right'))?.text || ''} retainedSide={retainedSide} />
+        </div>
         <footer className="statusbar"><span>{retainedSide ? '已保存内容' : <><i className="diff-key removed" />删除<i className="diff-key added" />新增<span className="status-note">实时比较 · 包含空白差异</span></>}</span><div>{retainedSide && retainedReceipt && hasOtherUnfinishedFile(review, retainedReceipt) && <button data-testid="resume-comparison" disabled={blocked} onClick={() => setComparisonOverrides(current => ({ ...current, [review.id]: retainedReceipt.operationId }))}>继续审阅另一文件</button>}{!retainedSide && (rejecting ? <><span>退回后保留审核历史</span><button data-testid="confirm-reject" disabled={busy} onClick={() => void action(async () => { await flushReview(review.id); await window.diffEditor.rejectReview(review.id); setRejecting(false); await refresh(); }, true)}>确认退回</button><button disabled={busy} onClick={() => setRejecting(false)}>取消</button></> : review.mode !== 'text' && <button data-testid="reject-review" disabled={blocked || review.targets.every(t => locked(t))} onClick={() => setRejecting(true)}>退回审核</button>)}<span>{labels[retainedSide || focusSide]}{retainedSide || locked(targetFor(review, focusSide)) ? '已锁定' : '正在编辑'}</span></div></footer>
       </> : <div className="empty-state"><div className="empty-symbol">⇄</div><h1>逐处比较和编辑文本</h1><p>两侧都可以编辑。草稿自动缓存，文件由你确认后保存。</p><div className="empty-buttons"><button data-testid="empty-new-text" className="primary" disabled={blocked} onClick={createText}>新建文本比较</button><button disabled={blocked} onClick={() => open('single')}>打开文件</button><button disabled={blocked} onClick={() => open('pair')}>比较两个文件</button></div><div className="empty-drop"><span>也可以将文本文件拖到这里</span></div><div className="cli-hint"><strong>接收 Agent 修改</strong><p>使用随附的 diffeditor 命令提交修改提案，在这里审核并保存。</p><code>diffeditor baseline paper.tex</code></div></div>}
     </main>
-    {dragging && <div className="drop-overlay" onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false); }} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); setDragging(false); }}><div className="drop-choice" data-testid="drop-single" onDrop={e => drop(e, 'single')}><strong>单文件编辑</strong><span>每个文件各开一项审核，两侧从相同内容开始</span></div><div className="drop-choice" data-testid="drop-pair" onDrop={e => drop(e, 'pair')}><strong>双文件比较</strong><span>拖入两个文件，左侧与右侧分别保存</span></div></div>}
+    {dragging && <div className="drop-overlay" onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false); }} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); setDragging(false); }}><div className="drop-choice" data-testid="drop-single" onDrop={e => drop(e, 'single')}><strong>单文件编辑</strong><span>每个文件各开一项审核，两侧从相同内容开始</span></div><div className="drop-choice" data-testid="drop-pair" onDrop={e => drop(e, 'pair')}><strong>双文件比较</strong><span>拖入两个文件，原稿与新稿分别保存</span></div></div>}
     {deletePrompt && <div className="modal-backdrop"><section className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" data-testid="delete-dialog"><h2 id="delete-dialog-title">删除比较？</h2><p className="delete-title">{deletePrompt.title}</p><p>这将删除应用中的这项比较和两侧缓存草稿，无法恢复。真实文件及备份文件不会删除。</p>{error && <p role="alert" className="pane-error">{error}</p>}<footer><button data-testid="cancel-delete" autoFocus disabled={busy} onClick={() => setDeletePrompt(undefined)}>取消</button><button data-testid="confirm-delete" disabled={busy} onClick={confirmDelete}>{busy ? '正在删除…' : '删除比较'}</button></footer></section></div>}
     {preview && <div className="modal-backdrop"><section className="save-dialog" role="dialog" aria-modal="true" aria-labelledby="save-dialog-title" data-testid="save-dialog"><header><h2 id="save-dialog-title">确认保存{labels[preview.preview.side]}</h2><button data-testid="cancel-save" aria-label="取消保存" disabled={busy} onClick={() => setPreview(undefined)}>×</button></header><dl className="save-details"><dt>目标文件</dt><dd data-testid="preview-target">{preview.preview.targetPath}</dd><dt>备份文件</dt><dd data-testid="preview-backup">{preview.preview.backupPath || (preview.preview.isNew ? '新建文件，无旧文件需要备份' : '没有备份路径')}</dd><dt>文件编码</dt><dd>{encodings[preview.preview.encoding]}</dd></dl><div className="preview-caption">本次将写入的完整内容<span>{preview.text.length.toLocaleString()} 个字符</span></div><pre data-testid="preview-text" className="frozen-text">{preview.text || <span className="muted">（空文件）</span>}</pre><footer><span>确认后写入目标文件；已有内容先备份。</span><button disabled={busy} onClick={() => setPreview(undefined)}>取消</button><button data-testid="confirm-save" className="primary" disabled={busy} onClick={() => void action(async () => { try { await window.diffEditor.commitSave(preview.preview.token); } catch (e) { setPreview(undefined); await refresh(); throw e; } setPreview(undefined); await refresh(); }, true)}>{busy ? '正在保存…' : '确认并保存'}</button></footer></section></div>}
   </div>;
