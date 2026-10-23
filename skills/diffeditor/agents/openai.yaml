@@ -1,0 +1,6 @@
+interface:
+  display_name: "DiffEditor"
+  short_description: "Prepare text proposals for human review and final UI save"
+  default_prompt: "Use $diffeditor to prepare a reviewable proposal for my local text while preserving the original files."
+policy:
+  allow_implicit_invocation: true
