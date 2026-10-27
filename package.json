@@ -1,6 +1,6 @@
 {
   "name": "diffeditor",
-  "version": "0.1.7",
+  "version": "0.1.9",
   "private": true,
   "description": "Local text review and editing with explicit approval and verified backups",
   "author": "DiffEditor",
@@ -38,7 +38,7 @@
     "appId": "local.diffeditor.desktop",
     "productName": "DiffEditor",
     "directories": {
-      "output": "release/0.1.7"
+      "output": "release/0.1.9"
     },
     "electronDist": "node_modules/electron/dist",
     "files": [

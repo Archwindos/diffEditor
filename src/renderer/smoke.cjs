@@ -27,6 +27,11 @@ async function installMock(page, pair = false, empty = false, proposal = false) 
         state.changed();
       },
       deleteReview: async id => { if (state.failDelete) throw Error('模拟删除失败'); state.deleted.push(id); state.reviews = state.reviews.filter(r => r.id !== id); state.changed(); },
+      deleteClosedReviews: async ids => {
+        if (state.failDelete) throw Error('模拟删除失败');
+        const deleted = state.reviews.filter(r => r.closedAt && ids.includes(r.id)).map(r => r.id);
+        state.deleted.push(...deleted); state.reviews = state.reviews.filter(r => !deleted.includes(r.id)); state.changed(); return deleted;
+      },
       updateDraft: async (request) => {
         state.updates.push(request);
         const current = state.reviews.find(r => r.id === request.reviewId), pane = current[request.side];
@@ -358,6 +363,43 @@ async function hoverTransfer(page, to, index = 0) {
     await textPage.waitForTimeout(600);
     assert.equal(await textPage.evaluate(() => window.__mock.reviews.length), 0);
     assert.equal(await textPage.evaluate(() => window.__mock.textCount), 2);
+    const bulkPage = await browser.newPage({ viewport: { width: 1000, height: 720 } });
+    trackErrors(bulkPage); await installMock(bulkPage);
+    await bulkPage.goto(process.env.DIFFEDITOR_TEST_URL || 'http://127.0.0.1:4173');
+    await bulkPage.getByTestId('review-r1').waitFor();
+    assert.equal(await bulkPage.getByTestId('delete-closed').count(), 0);
+    await bulkPage.evaluate(() => {
+      const template = window.__mock.reviews[0];
+      for (const id of ['closed-1', 'closed-2']) window.__mock.reviews.push({ ...structuredClone(template), id, title: `已关闭的知识记录 ${id}`, closedAt: new Date().toISOString() });
+      window.__mock.changed();
+    });
+    await bulkPage.getByTestId('delete-closed').click();
+    assert.match(await bulkPage.getByTestId('delete-dialog').innerText(), /全部 2 项已关闭比较/);
+    assert.equal(await bulkPage.getByTestId('delete-closed').isDisabled(), true);
+    await bulkPage.screenshot({ path: 'outputs/delete-closed-confirm-ui.png' });
+    await bulkPage.getByTestId('cancel-delete').click();
+    assert.deepEqual(await bulkPage.evaluate(() => window.__mock.deleted), []);
+    await bulkPage.evaluate(() => { window.__mock.failDelete = true; });
+    await bulkPage.getByTestId('delete-closed').click(); await bulkPage.getByTestId('confirm-delete').click();
+    await bulkPage.getByRole('alert').filter({ hasText: '模拟删除失败' }).waitFor();
+    assert.equal(await bulkPage.evaluate(() => window.__mock.reviews.length), 3);
+    await bulkPage.getByTestId('cancel-delete').click();
+    await bulkPage.evaluate(() => { window.__mock.failDelete = false; });
+    await bulkPage.getByTestId('delete-closed').click();
+    // A newly closed item after confirmation opened is not part of the batch.
+    await bulkPage.evaluate(() => {
+      window.__mock.reviews.push({ ...structuredClone(window.__mock.reviews[1]), id: 'later-closed' });
+      window.__mock.changed();
+    });
+    await bulkPage.getByTestId('confirm-delete').click();
+    await bulkPage.getByTestId('delete-dialog').waitFor({ state: 'hidden' });
+    assert.deepEqual(await bulkPage.evaluate(() => window.__mock.deleted), ['closed-1', 'closed-2']);
+    assert.equal(await bulkPage.getByTestId('review-r1').count(), 1);
+    await bulkPage.getByTestId('delete-closed').click(); await bulkPage.getByTestId('confirm-delete').click();
+    await bulkPage.getByTestId('delete-closed').waitFor({ state: 'hidden' });
+    assert.equal(await bulkPage.getByTestId('review-r1').count(), 1);
+    assert.equal(await bulkPage.evaluate(() => window.__mock.commits.length), 0);
+
     const mapPage = await browser.newPage({ viewport: { width: 1280, height: 800 } });
     trackErrors(mapPage); await installMock(mapPage, false, false, true);
     await mapPage.goto(process.env.DIFFEDITOR_TEST_URL || 'http://127.0.0.1:4173');
@@ -389,7 +431,12 @@ async function hoverTransfer(page, to, index = 0) {
     const selectionPage = await browser.newPage({ viewport: { width: 1280, height: 800 } });
     trackErrors(selectionPage); await installMock(selectionPage);
     await require('./selection-smoke.cjs')(selectionPage);
+    const findPage = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+    trackErrors(findPage); await installMock(findPage);
+    await findPage.goto(process.env.DIFFEDITOR_TEST_URL || 'http://127.0.0.1:4173');
+    await require('./find-smoke.cjs')(findPage);
+    assert.equal(await findPage.evaluate(() => window.__mock.updates.length + window.__mock.commits.length), 0);
     assert.deepEqual(pageErrors, []);
-    console.log('Renderer smoke passed: transparent selections over red/green diffs, version names and AI provenance, hover-only green/red directional transfers, colored text overview painting/click/drag/wheel/folding/keyboard/retained view, settings and prior draft/save/lifecycle regressions.');
+    console.log('Renderer smoke passed: find/replace tooltip mouse-close and Escape, transparent selections over red/green diffs, version names and AI provenance, hover-only green/red directional transfers, colored text overview painting/click/drag/wheel/folding/keyboard/retained view, settings and prior draft/save/lifecycle regressions.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

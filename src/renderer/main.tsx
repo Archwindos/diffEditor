@@ -109,7 +109,7 @@ function App() {
   const [currentChunk, setCurrentChunk] = useState(-1);
   const [dragging, setDragging] = useState(false);
   const [rejecting, setRejecting] = useState(false);
-  const [deletePrompt, setDeletePrompt] = useState<ReviewView>();
+  const [deletePrompt, setDeletePrompt] = useState<{ reviews: ReviewView[]; closedOnly: boolean }>();
   const [showClosed, setShowClosed] = useState(false);
   const deletingIds = useRef(new Set<string>());
   const removedIds = useRef(new Set<string>());
@@ -232,26 +232,38 @@ function App() {
   });
   const requestDelete = (current: ReviewView) => {
     if (blocked) return;
-    setError(''); setDeletePrompt(current);
+    setError(''); setDeletePrompt({ reviews: [current], closedOnly: false });
+  };
+  const requestDeleteClosed = () => {
+    if (blocked) return;
+    const closed = reviewsRef.current.filter(r => r.closedAt);
+    if (closed.length) { setError(''); setDeletePrompt({ reviews: closed, closedOnly: true }); }
   };
   const confirmDelete = () => {
     if (!deletePrompt) return;
-    const id = deletePrompt.id;
+    const ids = deletePrompt.reviews.map(r => r.id), closedOnly = deletePrompt.closedOnly;
     void action(async () => {
-      deletingIds.current.add(id); ++refreshGeneration.current;
-      for (const side of sides) clearTimeout(drafts.current.get(keyFor(id, side))?.timer);
-      await Promise.allSettled(sides.map(side => drafts.current.get(keyFor(id, side))?.queue));
+      ++refreshGeneration.current;
+      for (const id of ids) {
+        deletingIds.current.add(id);
+        for (const side of sides) clearTimeout(drafts.current.get(keyFor(id, side))?.timer);
+      }
+      await Promise.allSettled(ids.flatMap(id => sides.map(side => drafts.current.get(keyFor(id, side))?.queue)));
       try {
-        await window.diffEditor.deleteReview(id);
-        removedIds.current.add(id);
-        for (const side of sides) drafts.current.delete(keyFor(id, side));
-        merge(reviewsRef.current.filter(r => r.id !== id));
+        const deleted = closedOnly ? await window.diffEditor.deleteClosedReviews(ids) : (await window.diffEditor.deleteReview(ids[0]), ids);
+        for (const id of deleted) {
+          removedIds.current.add(id);
+          for (const side of sides) drafts.current.delete(keyFor(id, side));
+        }
+        merge(reviewsRef.current.filter(r => !removedIds.current.has(r.id)));
         setDeletePrompt(undefined);
       } finally {
-        deletingIds.current.delete(id);
-        if (!removedIds.current.has(id)) for (const side of sides) {
-          const draft = drafts.current.get(keyFor(id, side));
-          if (draft && draft.text !== draft.persisted) draft.timer = setTimeout(() => void flushPane(id, side).catch(() => {}), 450);
+        for (const id of ids) {
+          deletingIds.current.delete(id);
+          if (!removedIds.current.has(id)) for (const side of sides) {
+            const draft = drafts.current.get(keyFor(id, side));
+            if (draft && draft.text !== draft.persisted) draft.timer = setTimeout(() => void flushPane(id, side).catch(() => {}), 450);
+          }
         }
       }
       await refresh();
@@ -429,7 +441,7 @@ function App() {
         const state = statuses.length && statuses.every(s => s === 'saved') ? 'saved' : statuses.length && statuses.every(s => s === 'rejected') ? 'rejected' : statuses.includes('conflict') ? 'conflict' : statuses.includes('error') ? 'error' : 'pending';
         return <div key={r.id} className={`review-row ${selected === r.id ? 'selected' : ''}`}><button data-testid={`review-${r.id}`} className="review-item" disabled={blocked} onClick={() => void action(async () => { if (selected) await flushReview(selected); setSelected(r.id); })} title={r.targets.map(t => t.path).join('\n') || r.title}><span className="review-title">{r.title}</span><span className="review-detail"><i className={`status-dot ${state}`} />{r.mode === 'text' && !r.targets.length ? '文本草稿' : statusLabels[state]}<span>{r.mode === 'single' ? '单文件' : r.mode === 'pair' ? '双文件' : r.mode === 'text' ? '文本' : '修改提案'}</span></span></button><div className="review-row-actions"><button data-testid={`close-${r.id}`} disabled={blocked} onClick={() => closeReview(r.id)} aria-label={`关闭比较 ${r.title}`}>关闭</button><button data-testid={`delete-${r.id}`} disabled={blocked} onClick={() => requestDelete(r)} aria-label={`删除比较 ${r.title}`}>删除</button></div></div>;
       })}
-      {!!closedReviews.length && <><button className="closed-heading" data-testid="toggle-closed" aria-expanded={showClosed} onClick={() => setShowClosed(!showClosed)}>已关闭 <span>{closedReviews.length}</span></button>{showClosed && closedReviews.map(r => <div key={r.id} className="review-row closed-review" data-testid={`closed-${r.id}`}><span className="review-title" title={r.title}>{r.title}</span><div className="review-row-actions"><button data-testid={`reopen-${r.id}`} disabled={blocked} onClick={() => reopenReview(r.id)}>重新打开</button><button data-testid={`delete-${r.id}`} disabled={blocked} onClick={() => requestDelete(r)} aria-label={`删除比较 ${r.title}`}>删除</button></div></div>)}</>}
+      {!!closedReviews.length && <><div className="closed-controls"><button className="closed-heading" data-testid="toggle-closed" aria-expanded={showClosed} onClick={() => setShowClosed(!showClosed)}>已关闭 <span>{closedReviews.length}</span></button><button className="delete-closed" data-testid="delete-closed" disabled={blocked} onClick={requestDeleteClosed} aria-label="删除全部已关闭比较">删除全部</button></div>{showClosed && closedReviews.map(r => <div key={r.id} className="review-row closed-review" data-testid={`closed-${r.id}`}><span className="review-title" title={r.title}>{r.title}</span><div className="review-row-actions"><button data-testid={`reopen-${r.id}`} disabled={blocked} onClick={() => reopenReview(r.id)}>重新打开</button><button data-testid={`delete-${r.id}`} disabled={blocked} onClick={() => requestDelete(r)} aria-label={`删除比较 ${r.title}`}>删除</button></div></div>)}</>}
       </nav>
       <Settings disabled={blocked} />
       <div className="sidebar-foot"><span className="privacy-dot" />文件始终保存在本机</div>
@@ -461,7 +473,7 @@ function App() {
       </> : <div className="empty-state"><div className="empty-symbol">⇄</div><h1>逐处比较和编辑文本</h1><p>两侧都可以编辑。草稿自动缓存，文件由你确认后保存。</p><div className="empty-buttons"><button data-testid="empty-new-text" className="primary" disabled={blocked} onClick={createText}>新建文本比较</button><button disabled={blocked} onClick={() => open('single')}>打开文件</button><button disabled={blocked} onClick={() => open('pair')}>比较两个文件</button></div><div className="empty-drop"><span>也可以将文本文件拖到这里</span></div><div className="cli-hint"><strong>接收 Agent 修改</strong><p>使用随附的 diffeditor 命令提交修改提案，在这里审核并保存。</p><code>diffeditor baseline paper.tex</code></div></div>}
     </main>
     {dragging && <div className="drop-overlay" onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false); }} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); setDragging(false); }}><div className="drop-choice" data-testid="drop-single" onDrop={e => drop(e, 'single')}><strong>单文件编辑</strong><span>每个文件各开一项审核，两侧从相同内容开始</span></div><div className="drop-choice" data-testid="drop-pair" onDrop={e => drop(e, 'pair')}><strong>双文件比较</strong><span>拖入两个文件，原稿与新稿分别保存</span></div></div>}
-    {deletePrompt && <div className="modal-backdrop"><section className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" data-testid="delete-dialog"><h2 id="delete-dialog-title">删除比较？</h2><p className="delete-title">{deletePrompt.title}</p><p>这将删除应用中的这项比较和两侧缓存草稿，无法恢复。真实文件及备份文件不会删除。</p>{error && <p role="alert" className="pane-error">{error}</p>}<footer><button data-testid="cancel-delete" autoFocus disabled={busy} onClick={() => setDeletePrompt(undefined)}>取消</button><button data-testid="confirm-delete" disabled={busy} onClick={confirmDelete}>{busy ? '正在删除…' : '删除比较'}</button></footer></section></div>}
+    {deletePrompt && <div className="modal-backdrop"><section className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" data-testid="delete-dialog"><h2 id="delete-dialog-title">{deletePrompt.closedOnly ? `删除全部 ${deletePrompt.reviews.length} 项已关闭比较？` : '删除比较？'}</h2>{deletePrompt.closedOnly ? <ul className="delete-review-list">{deletePrompt.reviews.map(r => <li key={r.id}>{r.title}</li>)}</ul> : <p className="delete-title">{deletePrompt.reviews[0].title}</p>}<p>这将删除应用中的{deletePrompt.closedOnly ? '这些比较' : '这项比较'}和两侧缓存草稿，无法恢复。真实文件及备份文件不会删除。</p>{error && <p role="alert" className="pane-error">{error}</p>}<footer><button data-testid="cancel-delete" autoFocus disabled={busy} onClick={() => setDeletePrompt(undefined)}>取消</button><button data-testid="confirm-delete" disabled={busy} onClick={confirmDelete}>{busy ? '正在删除…' : deletePrompt.closedOnly ? `删除这 ${deletePrompt.reviews.length} 项` : '删除比较'}</button></footer></section></div>}
     {preview && <div className="modal-backdrop"><section className="save-dialog" role="dialog" aria-modal="true" aria-labelledby="save-dialog-title" data-testid="save-dialog"><header><h2 id="save-dialog-title">确认保存{labels[preview.preview.side]}</h2><button data-testid="cancel-save" aria-label="取消保存" disabled={busy} onClick={() => setPreview(undefined)}>×</button></header><dl className="save-details"><dt>目标文件</dt><dd data-testid="preview-target">{preview.preview.targetPath}</dd><dt>备份文件</dt><dd data-testid="preview-backup">{preview.preview.backupPath || (preview.preview.isNew ? '新建文件，无旧文件需要备份' : '没有备份路径')}</dd><dt>文件编码</dt><dd>{encodings[preview.preview.encoding]}</dd></dl><div className="preview-caption">本次将写入的完整内容<span>{preview.text.length.toLocaleString()} 个字符</span></div><pre data-testid="preview-text" className="frozen-text">{preview.text || <span className="muted">（空文件）</span>}</pre><footer><span>确认后写入目标文件；已有内容先备份。</span><button disabled={busy} onClick={() => setPreview(undefined)}>取消</button><button data-testid="confirm-save" className="primary" disabled={busy} onClick={() => void action(async () => { try { await window.diffEditor.commitSave(preview.preview.token); } catch (e) { setPreview(undefined); await refresh(); throw e; } setPreview(undefined); await refresh(); }, true)}>{busy ? '正在保存…' : '确认并保存'}</button></footer></section></div>}
   </div>;
 }

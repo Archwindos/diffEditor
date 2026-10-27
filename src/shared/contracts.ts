@@ -66,6 +66,7 @@ export interface DesktopAPI {
   createTextReview(): Promise<ReviewView>;
   setReviewClosed(reviewId: string, closed: boolean): Promise<void>;
   deleteReview(reviewId: string): Promise<void>;
+  deleteClosedReviews(reviewIds: string[]): Promise<string[]>;
   updateDraft(request: UpdateDraftRequest): Promise<ReviewView>;
   prepareSave(request: PrepareSaveRequest): Promise<SavePreview | null>;
   commitSave(token: string): Promise<SaveReceipt>;

@@ -162,17 +162,30 @@ export class ReviewStore {
   async deleteReview(reviewId: string): Promise<void> {
     return this.serial(async () => {
       if (this.state.deleted?.[reviewId]) return;
-      const next = copy(this.state), review = this.review(next, reviewId);
-      if (review.targets.some(target => target.status === 'saving')) throw new Error('正在保存，请稍候');
-      this.assertNoUnresolvedSave(next, reviewId);
-      const { left, right, targets } = this.view(review);
-      (next.deleted ??= {})[reviewId] = { id: review.id, title: review.title, targets, leftRevision: left.revision, rightRevision: right.revision, lifecycle: 'deleted' };
-      next.reviews = next.reviews.filter(item => item.id !== reviewId);
-      for (const [token, plan] of Object.entries(next.plans)) if (plan.preview.reviewId === reviewId) delete next.plans[token];
-      for (const target of review.targets) if (!next.reviews.some(item => item.targets.some(other => other.snapshot.id === target.snapshot.id))) delete next.baselines[target.snapshot.id];
-      for (const request of Object.values(next.requests)) if (request.reviewIds.includes(reviewId) && request.payload !== undefined) { request.payloadHash = hash(Buffer.from(request.payload)); delete request.payload; }
+      const next = copy(this.state);
+      this.removeReview(next, reviewId);
       await this.persist(next);
     });
+  }
+  async deleteClosedReviews(reviewIds: string[]): Promise<string[]> {
+    return this.serial(async () => {
+      const next = copy(this.state), requested = new Set(reviewIds);
+      const ids = next.reviews.filter(review => review.closedAt && requested.has(review.id)).map(review => review.id);
+      for (const id of ids) this.removeReview(next, id);
+      if (ids.length) await this.persist(next);
+      return ids;
+    });
+  }
+  private removeReview(next: State, reviewId: string) {
+    const review = this.review(next, reviewId);
+    if (review.targets.some(target => target.status === 'saving')) throw new Error('正在保存，请稍候');
+    this.assertNoUnresolvedSave(next, reviewId);
+    const { left, right, targets } = this.view(review);
+    (next.deleted ??= {})[reviewId] = { id: review.id, title: review.title, targets, leftRevision: left.revision, rightRevision: right.revision, lifecycle: 'deleted' };
+    next.reviews = next.reviews.filter(item => item.id !== reviewId);
+    for (const [token, plan] of Object.entries(next.plans)) if (plan.preview.reviewId === reviewId) delete next.plans[token];
+    for (const target of review.targets) if (!next.reviews.some(item => item.targets.some(other => other.snapshot.id === target.snapshot.id))) delete next.baselines[target.snapshot.id];
+    for (const request of Object.values(next.requests)) if (request.reviewIds.includes(reviewId) && request.payload !== undefined) { request.payloadHash = hash(Buffer.from(request.payload)); delete request.payload; }
   }
   async submit(request: SubmitRequest): Promise<SubmitResponse> {
     return this.serial(async () => {

@@ -126,6 +126,7 @@ function handlers() {
   handle('review:new-text', () => store.createTextReview());
   handle('review:set-closed', (reviewId, closed) => store.setReviewClosed(reviewId, closed));
   handle('review:delete', reviewId => store.deleteReview(reviewId));
+  handle('review:delete-closed', reviewIds => store.deleteClosedReviews(reviewIds));
   handle('review:pick', async (mode: 'single' | 'pair', encoding?: TextEncoding) => {
     const choice = await dialog.showOpenDialog(win!, { title: mode === 'pair' ? '选择两个文本文件' : '打开文本文件',
       properties: ['openFile', 'multiSelections'],

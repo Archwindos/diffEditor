@@ -8,7 +8,7 @@ import type { ReviewStore } from '../src/core/store';
 test('the pipe cannot approve or write, even when the caller bypasses the CLI parser', async () => {
   let calls = 0;
   const store = new Proxy({}, { get() { return () => { calls++; throw new Error('unexpected operation'); }; } }) as ReviewStore;
-  for (const command of ['approve', 'save', 'force-save', 'commitSave', 'review:commit', 'createTextReview', 'setReviewClosed', 'deleteReview', 'review:delete', 'constructor']) {
+  for (const command of ['approve', 'save', 'force-save', 'commitSave', 'review:commit', 'createTextReview', 'setReviewClosed', 'deleteReview', 'review:delete', 'deleteClosedReviews', 'review:delete-closed', 'constructor']) {
     const reply = await handleCli(store, { command, payload: { token: 'forged' } }, () => {});
     assert.equal(reply.ok, false);
   }

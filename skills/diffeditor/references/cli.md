@@ -1,5 +1,7 @@
 # CLI contract
 
+Use this protocol for files requiring review under [SKILL.md](../SKILL.md). The first draft of an AI-created document normally bypasses this protocol; later revisions of user-facing material require it. Code and internal agent progress records are outside automatic review unless the user explicitly requests it.
+
 The supported AI interface is the local CLI over a per-user named pipe. Its only commands are `baseline`, `submit`, `status`, and `wait`. It has no approve, save, force, close, reopen, or delete operation. Those UI actions belong to the human. `wait` only observes their results.
 
 Every successful command prints one UTF-8 JSON result and exits 0. For `wait`, exit 0 means a valid observation result; it can report `attention` or `timeout`, neither of which proves saving. Errors print `{ "ok": false, "error": "...", "code": "..." }` and exit nonzero. Inspect both exit code and JSON result. Launching the GUI alone is never success.
@@ -25,6 +27,8 @@ Before generating a candidate, create a unique subdirectory under `%LOCALAPPDATA
 ```
 
 Submit using `submit --file <absolute-json-path>` or `submit --stdin`. Only `requestId`, optional `title`, and `files` are accepted; each file has `baselineId` and `text`. For stdin, use a subprocess argument array and `input=json.dumps(payload, ensure_ascii=False).encode("utf-8")`; do not construct a shell command containing the text. A successful result has `reviewIds` and `duplicate`, for example `{"reviewIds":["review-id"],"duplicate":false}`.
+
+When a script writes a document requiring review, create an independent temporary text file in that workflow directory first. Initialize it from the original baseline if needed, and direct all script edits to that temporary file. Read back its contents into `text`, paired with the **original** file's `baselineId`. This presents the original and temporary draft together while keeping the original as the eventual UI save target. The CLI does not accept two file paths as a comparison command. Never replace the original with the temporary file yourself.
 
 ## Read status accurately
 
@@ -75,7 +79,7 @@ If the connection fails, report it, inspect `status` for the same IDs when possi
 
 ## Argument-array invocation
 
-Use Python's subprocess argument arrays to call the bundled helper. This preserves Windows spaces, Unicode, `%`, `&`, quotes, backslashes, and document newlines without a command shell. The candidate belongs only in a JSON file under the inbox or in stdin bytes, never in command-line arguments or a shell here-string. Example inside an existing Python script, with `helper`, `workflow_dir`, and `target` set to absolute paths:
+Use Python's subprocess argument arrays to call the bundled helper. This preserves Windows spaces, Unicode, `%`, `&`, quotes, backslashes, and document newlines without a command shell. Temporary draft text and candidate JSON stay under the inbox; submit the serialized candidate through a JSON file or stdin, never through document text in command-line arguments or a shell here-string. Example inside an existing Python script, with `helper`, `workflow_dir`, and `target` set to absolute `pathlib.Path` objects:
 
 ```python
 import json
@@ -99,9 +103,21 @@ baseline = call("baseline", str(target))
 with (workflow_dir / "baseline.json").open("xb") as receipt:
     receipt.write(json.dumps(baseline, ensure_ascii=False).encode("utf-8"))
 
+# First create a separate temporary document from the original baseline.
+draft_path = workflow_dir / ("proposed" + (target.suffix or ".txt"))
+with draft_path.open("xb") as draft:
+    draft.write(baseline["files"][0]["text"].encode("utf-8"))
+
 # Generate the authorized complete replacement only after reading baseline.
+# Write it to the temporary document, never target. For an external editing
+# script, pass draft_path as its output (and input when editing in place).
+with draft_path.open("wb") as draft:
+    draft.write(complete_candidate_text.encode("utf-8"))
+
+# Read bytes and decode explicitly to preserve mixed CR/LF and final newlines.
+proposed_text = draft_path.read_bytes().decode("utf-8", errors="strict")
 payload = {"requestId": str(uuid4()), "files": [
-    {"baselineId": baseline["files"][0]["id"], "text": complete_candidate_text}
+    {"baselineId": baseline["files"][0]["id"], "text": proposed_text}
 ]}
 with (workflow_dir / "candidate.json").open("xb") as candidate:
     candidate.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))

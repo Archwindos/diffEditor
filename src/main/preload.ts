@@ -19,6 +19,7 @@ const api: DesktopAPI = {
   createTextReview: () => call('review:new-text'),
   setReviewClosed: (reviewId, closed) => call('review:set-closed', reviewId, closed),
   deleteReview: reviewId => call('review:delete', reviewId),
+  deleteClosedReviews: reviewIds => call('review:delete-closed', reviewIds),
   updateDraft: request => call('review:update', request),
   prepareSave: request => call('review:prepare', request),
   commitSave: token => call('review:commit', token),

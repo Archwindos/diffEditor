@@ -136,6 +136,68 @@ test('deletion removes text and tokens, preserves receipt metadata, disk and bac
   await reloaded.openFiles({ paths: [target], mode: 'single' });
 });
 
+test('bulk delete removes only confirmed still-closed comparisons and preserves files, receipts and replay history', async t => {
+  const { root, dataDir, store } = await fixture(t);
+  const savedPath = path.join(root, '已保存.md'), pendingPath = path.join(root, '待审.md');
+  await fs.writeFile(savedPath, '旧稿\r\n'); await fs.writeFile(pendingPath, '原稿不变');
+  const baseline = await store.baseline({ paths: [savedPath, pendingPath] });
+  const request = { requestId: 'bulk-delete', files: baseline.files.map(file => ({ baselineId: file.id, text: '批量待审草稿' })) };
+  const { reviewIds } = await store.submit(request);
+  const preview = await store.prepareSave({ reviewId: reviewIds[0], side: 'right', expectedRevision: 0 });
+  const receipt = await store.commitSave(preview.token);
+  for (const id of reviewIds) await store.setReviewClosed(id, true);
+  const reopened = await store.createTextReview(); await store.setReviewClosed(reopened.id, true);
+  const confirmed = [...reviewIds, reopened.id];
+  await store.setReviewClosed(reopened.id, false);
+  const laterClosed = await store.createTextReview(); await store.setReviewClosed(laterClosed.id, true);
+  const open = await store.createTextReview();
+  await store.updateDraft({ reviewId: open.id, side: 'right', expectedRevision: 0, text: '打开的草稿保留' });
+  const filesBefore = await Promise.all([savedPath, pendingPath, receipt.backupPath!].map(file => fs.readFile(file)));
+  const deleted = await store.deleteClosedReviews([...confirmed, open.id, reviewIds[0]]);
+  assert.deepEqual(deleted, reviewIds);
+  assert.deepEqual(store.list().reviews.map(r => r.id), [reopened.id, laterClosed.id, open.id]);
+  assert.equal(store.list().reviews.find(r => r.id === open.id)!.right.text, '打开的草稿保留');
+  assert.deepEqual(await Promise.all([savedPath, pendingPath, receipt.backupPath!].map(file => fs.readFile(file))), filesBefore);
+  assert.deepEqual(store.status(reviewIds[0]).reviews[0].targets[0].receipt, receipt);
+  assert.equal(store.status(reviewIds[1]).reviews[0].lifecycle, 'deleted');
+  assert.deepEqual(await store.deleteClosedReviews(confirmed), []);
+  const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
+  assert.deepEqual(await reloaded.submit(request), { reviewIds, duplicate: true });
+  assert.equal(reloaded.list().reviews.length, 3);
+});
+
+test('bulk delete is all-or-nothing when any closed comparison has an unresolved save', async t => {
+  const { root, dataDir } = await fixture(t), target = path.join(root, 'interrupted-bulk.txt');
+  await fs.writeFile(target, 'original');
+  const store = new ReviewStore({ dataDir, failpoint: point => { if (point === 'afterReplace') throw new Error('interrupted'); } }); await store.init();
+  const safe = await store.createTextReview(); await store.setReviewClosed(safe.id, true);
+  const review = (await store.openFiles({ paths: [target], mode: 'single' })).reviews.find(r => r.id !== safe.id)!;
+  await store.updateDraft({ reviewId: review.id, side: 'right', expectedRevision: 0, text: 'replacement' });
+  const preview = await store.prepareSave({ reviewId: review.id, side: 'right', expectedRevision: 1 });
+  await assert.rejects(store.commitSave(preview.token), /interrupted/);
+  await store.setReviewClosed(review.id, true);
+  const before = store.list(), cache = await fs.readFile(path.join(dataDir, 'state.json'));
+  await assert.rejects(store.deleteClosedReviews([safe.id, review.id]), /尚未核验/);
+  assert.deepEqual(store.list(), before);
+  assert.deepEqual(await fs.readFile(path.join(dataDir, 'state.json')), cache);
+  assert.equal(await fs.readFile(target, 'utf8'), 'replacement');
+});
+
+test('failed bulk cache write retains every comparison and permits a later retry', async t => {
+  const { dataDir, store } = await fixture(t), a = await store.createTextReview(), b = await store.createTextReview();
+  for (const id of [a.id, b.id]) await store.setReviewClosed(id, true);
+  const before = store.list(), statePath = path.join(dataDir, 'state.json'), retained = path.join(dataDir, 'retained-state.json');
+  await fs.rename(statePath, retained); await fs.mkdir(statePath);
+  try {
+    await assert.rejects(store.deleteClosedReviews([a.id, b.id]));
+    assert.deepEqual(store.list(), before);
+  } finally { await fs.rmdir(statePath); await fs.rename(retained, statePath); }
+  const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
+  assert.deepEqual(reloaded.list(), before);
+  assert.deepEqual(await reloaded.deleteClosedReviews([a.id, b.id]), [a.id, b.id]);
+  assert.deepEqual(reloaded.list().reviews, []);
+});
+
 test('deleting a pending blank comparison invalidates preview and never creates its destination', async t => {
   const { root, store } = await fixture(t), review = await store.createTextReview(), target = path.join(root, 'never-created.txt');
   const preview = await store.prepareSave({ reviewId: review.id, side: 'left', expectedRevision: 0, newPath: target });
