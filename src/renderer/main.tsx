@@ -13,6 +13,7 @@ import 'monaco-editor/esm/vs/basic-languages/yaml/yaml.contribution.js';
 import 'monaco-editor/esm/vs/basic-languages/shell/shell.contribution.js';
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import type { ReviewView, Side, SavePreview, TextEncoding, TargetView } from '../shared/contracts';
+import { proposalCompletionAt } from '../shared/completion';
 import { replaceChunk } from './chunks';
 import { hasOtherUnfinishedFile, retainedReceiptFor } from './retained';
 import { Settings } from './Settings';
@@ -32,18 +33,19 @@ monaco.editor.defineTheme('review-light', {
   },
 });
 
-type Draft = { text: string; persisted: string; revision: number; state: 'cached' | 'caching' | 'error'; error?: string; queue: Promise<void>; timer?: ReturnType<typeof setTimeout>; inFlight: boolean };
+type Draft = { text: string; persisted: string; edited: boolean; revision: number; state: 'cached' | 'caching' | 'error'; error?: string; queue: Promise<void>; timer?: ReturnType<typeof setTimeout>; inFlight: boolean };
 type FrozenPreview = { preview: SavePreview; text: string };
 const sides: Side[] = ['left', 'right'];
 const labels: Record<Side, string> = { left: '原稿（左）', right: '新稿（右）' };
 const versionNames: Record<Side, string> = { left: '原稿', right: '新稿' };
 const encodings: Record<TextEncoding, string> = { utf8: 'UTF-8', utf16le: 'UTF-16 LE', utf16be: 'UTF-16 BE', gb18030: 'GB18030' };
-const statusLabels: Record<string, string> = { pending: '待审核', saving: '正在保存', saved: '已正式保存', conflict: '文件有冲突', error: '保存失败', rejected: '已退回' };
+const statusLabels: Record<string, string> = { pending: '待审核', saving: '正在保存', saved: '已正式保存', conflict: '文件有冲突', error: '保存失败', rejected: '已退回', withdrawn: 'AI 已撤回' };
 const errorText = (e: unknown) => e instanceof Error ? e.message : String(e);
 const basename = (path: string) => path.split(/[\\/]/).pop() || path;
 const keyFor = (id: string, side: Side) => `${id}:${side}`;
 const targetFor = (review: ReviewView, side: Side) => review.targets.find(t => t.id === review[side].targetId);
-const locked = (target?: TargetView) => !!target && ['saved', 'saving', 'rejected'].includes(target.status);
+const locked = (target?: TargetView) => !!target && ['saved', 'saving', 'rejected', 'withdrawn'].includes(target.status);
+const isWithdrawn = (review?: ReviewView) => !!review && (!!review.withdrawnAt || review.targets.some(t => t.status === 'withdrawn'));
 const canSave = (target?: TargetView) => !target || target.status === 'pending';
 const isUncreatedText = (review: ReviewView, target?: TargetView) => review.mode === 'text' && (!target || (!target.exists && target.status === 'pending'));
 monaco.languages.register({ id: 'latex' });
@@ -108,13 +110,17 @@ function App() {
   const [hoveredChunk, setHoveredChunk] = useState<{ index: number; to: Side }>();
   const [currentChunk, setCurrentChunk] = useState(-1);
   const [dragging, setDragging] = useState(false);
-  const [rejecting, setRejecting] = useState(false);
+  const [rejecting, setRejecting] = useState<Pick<ReviewView, 'id' | 'title' | 'mode'>>();
+  const rejectDialog = useRef<HTMLElement>(null);
   const [deletePrompt, setDeletePrompt] = useState<{ reviews: ReviewView[]; closedOnly: boolean }>();
   const [showClosed, setShowClosed] = useState(false);
   const deletingIds = useRef(new Set<string>());
   const removedIds = useRef(new Set<string>());
-  const modalRef = useRef(false); modalRef.current = !!preview || !!deletePrompt || rejecting;
-  const blocked = busy || !!preview || !!deletePrompt || rejecting;
+  const withdrawalLocks = useRef(new Map<string, string>());
+  const [withdrawalCount, setWithdrawalCount] = useState(0);
+  const modalRef = useRef(false); modalRef.current = !!preview || !!deletePrompt || !!rejecting;
+  const blocked = busy || !!preview || !!deletePrompt || !!rejecting || withdrawalCount > 0;
+  const modalBlocked = busy || withdrawalCount > 0;
   const drafts = useRef(new Map<string, Draft>());
   const reviewsRef = useRef(reviews); reviewsRef.current = reviews;
   const selectedRef = useRef(selected); selectedRef.current = selected;
@@ -129,17 +135,39 @@ function App() {
   const refreshGeneration = useRef(0);
   const bump = () => redraw(n => n + 1);
   const review = reviews.find(r => r.id === selected && !r.closedAt);
+  const reviewWithdrawn = isWithdrawn(review);
   const retainedReceipt = review && retainedReceiptFor(review);
   const retainedSide = retainedReceipt && comparisonOverrides[review!.id] !== retainedReceipt.operationId ? retainedReceipt.side : undefined;
-  const openReviews = reviews.filter(r => !r.closedAt);
-  const closedReviews = reviews.filter(r => r.closedAt);
+  const newestReviews = [...reviews].reverse().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const openReviews = newestReviews.filter(r => !r.closedAt);
+  const closedReviews = newestReviews.filter(r => r.closedAt).sort((a, b) => {
+    const aCompleted = proposalCompletionAt(a), bCompleted = proposalCompletionAt(b);
+    if (aCompleted && bCompleted) return bCompleted.localeCompare(aCompleted) || a.id.localeCompare(b.id);
+    return aCompleted ? -1 : bCompleted ? 1 : 0;
+  });
 
   const merge = useCallback((incoming: ReviewView[]) => {
-    incoming = incoming.filter(r => !removedIds.current.has(r.id));
+    let revealCompleted = false;
+    incoming = incoming.filter(r => !removedIds.current.has(r.id)).map(r => {
+      const known = reviewsRef.current.find(current => current.id === r.id);
+      const knownCompleted = known && proposalCompletionAt(known), incomingCompleted = proposalCompletionAt(r);
+      // Cache/list responses can predate completion or an explicit human reopen.
+      // Keep pane revisions from those responses, but retain the newer lifecycle.
+      if (knownCompleted && (!incomingCompleted || r.updatedAt <= known!.updatedAt)) {
+        r = { ...r, closedAt: known!.closedAt, updatedAt: known!.updatedAt, withdrawnAt: known!.withdrawnAt,
+          targets: r.targets.map(t => {
+            const terminal = known!.targets.find(target => target.id === t.id);
+            return terminal ? { ...t, status: terminal.status, receipt: terminal.receipt } : t;
+          }) };
+      }
+      if (isWithdrawn(known)) r = { ...r, withdrawnAt: known!.withdrawnAt, targets: r.targets.map(t => ({ ...t, status: 'withdrawn' as const })) };
+      if (r.closedAt && proposalCompletionAt(r) && (!known?.closedAt || proposalCompletionAt(known) !== proposalCompletionAt(r))) revealCompleted = true;
+      return r;
+    });
     for (const r of incoming) for (const side of sides) {
       const key = keyFor(r.id, side), existing = drafts.current.get(key), pane = r[side];
-      if (!existing) drafts.current.set(key, { text: pane.text, persisted: pane.text, revision: pane.revision, state: 'cached', queue: Promise.resolve(), inFlight: false });
-      else if (!existing.inFlight && existing.text === existing.persisted && pane.revision >= existing.revision) {
+      if (!existing) drafts.current.set(key, { text: pane.text, persisted: pane.text, edited: false, revision: pane.revision, state: 'cached', queue: Promise.resolve(), inFlight: false });
+      else if (!existing.inFlight && !existing.edited && existing.text === existing.persisted && pane.revision >= existing.revision) {
         existing.text = pane.text; existing.persisted = pane.text; existing.revision = pane.revision;
       } else if (!existing.inFlight && pane.revision > existing.revision) {
         existing.state = 'error'; existing.error = '草稿版本已变化。当前编辑已保留，请先处理其他窗口或外部更新。';
@@ -147,6 +175,7 @@ function App() {
     }
     reviewsRef.current = incoming;
     setReviews(incoming);
+    if (revealCompleted) setShowClosed(true);
     setSelected(current => current && incoming.some(r => r.id === current && !r.closedAt) ? current : incoming.find(r => !r.closedAt)?.id);
     bump();
   }, []);
@@ -167,16 +196,18 @@ function App() {
     if (!draft || deletingIds.current.has(id) || removedIds.current.has(id)) return;
     clearTimeout(draft.timer);
     const job = draft.queue.catch(() => {}).then(async () => {
-      while (draft.text !== draft.persisted && !deletingIds.current.has(id) && !removedIds.current.has(id)) {
+      // A human edit followed by undo still needs a persisted revision.
+      while ((draft.edited || draft.text !== draft.persisted) && !deletingIds.current.has(id) && !removedIds.current.has(id)) {
         const text = draft.text;
+        draft.edited = false;
         draft.state = 'caching'; draft.inFlight = true; draft.error = undefined; bump();
         try {
           const updated = await window.diffEditor.updateDraft({ reviewId: id, side, text, expectedRevision: draft.revision });
           draft.revision = updated[side].revision; draft.persisted = text;
-          draft.state = draft.text === text ? 'cached' : 'caching';
+          draft.state = !draft.edited && draft.text === text ? 'cached' : 'caching';
           applyReview(updated);
         } catch (e) {
-          draft.state = 'error'; draft.error = errorText(e); throw e;
+          draft.edited = true; draft.state = 'error'; draft.error = errorText(e); throw e;
         } finally { draft.inFlight = false; bump(); }
       }
     });
@@ -193,20 +224,54 @@ function App() {
   };
   const edit = (side: Side, text: string) => {
     const id = selectedRef.current;
-    if (!id || suppress.current || deletingIds.current.has(id) || removedIds.current.has(id)) return;
+    if (!id || suppress.current || withdrawalLocks.current.size || isWithdrawn(reviewsRef.current.find(r => r.id === id)) || deletingIds.current.has(id) || removedIds.current.has(id)) return;
     const draft = drafts.current.get(keyFor(id, side));
-    if (!draft) return;
-    draft.text = text; draft.state = text === draft.persisted ? 'cached' : 'caching'; draft.error = undefined;
+    if (!draft || draft.text === text) return;
+    draft.text = text; draft.edited = true; draft.state = 'caching'; draft.error = undefined;
     clearTimeout(draft.timer);
-    if (text !== draft.persisted) draft.timer = setTimeout(() => void flushPane(id, side).catch(() => {}), 450);
+    draft.timer = setTimeout(() => void flushPane(id, side).catch(() => {}), 450);
     bump();
   };
   const action = async (task: () => Promise<void>, fromModal = false) => {
-    if (busyRef.current || (modalRef.current && !fromModal)) return;
+    if (withdrawalLocks.current.size || busyRef.current || (modalRef.current && !fromModal)) return;
     busyRef.current = true; setBusy(true); setError('');
     try { await task(); } catch (e) { setError(errorText(e)); }
     finally { busyRef.current = false; setBusy(false); }
   };
+  const requestReject = (current: ReviewView) => {
+    if (withdrawalLocks.current.size || isWithdrawn(current)) return;
+    setError(''); setRejecting({ id: current.id, title: current.title, mode: current.mode });
+  };
+  const cancelReject = () => {
+    if (!withdrawalLocks.current.size && !busyRef.current) { setRejecting(undefined); setError(''); }
+  };
+  useEffect(() => {
+    if (rejecting && isWithdrawn(reviews.find(r => r.id === rejecting.id))) { setRejecting(undefined); setError(''); }
+    if (preview && isWithdrawn(reviews.find(r => r.id === preview.preview.reviewId))) setPreview(undefined);
+  }, [reviews, rejecting, preview]);
+  useEffect(() => {
+    if (!rejecting) return;
+    const dialog = rejectDialog.current;
+    const previous = document.activeElement as HTMLElement | null;
+    dialog?.querySelector<HTMLButtonElement>('[data-testid="cancel-reject"]')?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault(); event.stopPropagation(); cancelReject();
+      } else if (event.key === 'Tab') {
+        const buttons = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
+        const first = buttons[0], last = buttons[buttons.length - 1];
+        if (!first) { event.preventDefault(); return; }
+        if (!dialog?.contains(document.activeElement) || (event.shiftKey ? document.activeElement === first : document.activeElement === last)) {
+          event.preventDefault(); (event.shiftKey ? last : first).focus();
+        }
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      if (previous?.isConnected && !previous.matches(':disabled')) previous.focus();
+    };
+  }, [rejecting?.id]);
   const open = (mode: 'single' | 'pair') => void action(async () => {
     await flushAll();
     const before = new Set(reviewsRef.current.map(r => r.id));
@@ -231,11 +296,12 @@ function App() {
     await refresh(); setSelected(id);
   });
   const requestDelete = (current: ReviewView) => {
-    if (blocked) return;
-    setError(''); setDeletePrompt({ reviews: [current], closedOnly: false });
+    const closed = reviewsRef.current.find(r => r.id === current.id && r.closedAt);
+    if (withdrawalLocks.current.size || blocked || !closed) return;
+    setError(''); setDeletePrompt({ reviews: [closed], closedOnly: false });
   };
   const requestDeleteClosed = () => {
-    if (blocked) return;
+    if (withdrawalLocks.current.size || blocked) return;
     const closed = reviewsRef.current.filter(r => r.closedAt);
     if (closed.length) { setError(''); setDeletePrompt({ reviews: closed, closedOnly: true }); }
   };
@@ -243,6 +309,11 @@ function App() {
     if (!deletePrompt) return;
     const ids = deletePrompt.reviews.map(r => r.id), closedOnly = deletePrompt.closedOnly;
     void action(async () => {
+      const latest = await window.diffEditor.list();
+      if (ids.some(id => !latest.reviews.some(r => r.id === id && r.closedAt))) {
+        merge(latest.reviews); setDeletePrompt(undefined);
+        throw new Error('比较状态已变化，请重新选择已关闭比较后删除。');
+      }
       ++refreshGeneration.current;
       for (const id of ids) {
         deletingIds.current.add(id);
@@ -262,7 +333,7 @@ function App() {
           deletingIds.current.delete(id);
           if (!removedIds.current.has(id)) for (const side of sides) {
             const draft = drafts.current.get(keyFor(id, side));
-            if (draft && draft.text !== draft.persisted) draft.timer = setTimeout(() => void flushPane(id, side).catch(() => {}), 450);
+            if (draft && (draft.edited || draft.text !== draft.persisted)) draft.timer = setTimeout(() => void flushPane(id, side).catch(() => {}), 450);
           }
         }
       }
@@ -270,19 +341,35 @@ function App() {
     }, true);
   };
   const saveSide = async (side: Side) => {
-    if (modalRef.current) return;
+    if (withdrawalLocks.current.size || modalRef.current) return;
     const current = reviewsRef.current.find(r => r.id === selectedRef.current);
-    if (!current || !canSave(targetFor(current, side))) return;
+    if (!current || current.closedAt || isWithdrawn(current)) return;
+    if (current.mode === 'proposal' && side === 'left') {
+      if (!busyRef.current && current.targets.some(t => !locked(t))) requestReject(current);
+      return;
+    }
+    if (!canSave(targetFor(current, side))) return;
     await action(async () => {
       await flushReview(current.id);
       const draft = drafts.current.get(keyFor(current.id, side))!;
       const frozenText = draft.text;
       const frozen = await window.diffEditor.prepareSave({ reviewId: current.id, side, expectedRevision: draft.revision, encoding: saveEncoding[side] });
-      if (frozen) setPreview({ preview: frozen, text: frozenText });
+      if (frozen && !withdrawalLocks.current.size && !isWithdrawn(reviewsRef.current.find(r => r.id === current.id))) setPreview({ preview: frozen, text: frozenText });
     });
   };
   const saveRef = useRef(saveSide); saveRef.current = saveSide;
   const flushRef = useRef(flushAll); flushRef.current = flushAll;
+  const flushReviewRef = useRef(flushReview); flushReviewRef.current = flushReview;
+  const syncEditorLock = () => {
+    const current = reviewsRef.current.find(r => r.id === selectedRef.current);
+    const frozen = withdrawalLocks.current.size > 0 || busyRef.current || modalRef.current || isWithdrawn(current);
+    const leftLocked = frozen || locked(current && targetFor(current, 'left'));
+    const rightLocked = frozen || locked(current && targetFor(current, 'right'));
+    const diff = diffRef.current;
+    diff?.updateOptions({ originalEditable: !leftLocked, readOnly: rightLocked });
+    diff?.getOriginalEditor().updateOptions({ readOnly: leftLocked });
+    diff?.getModifiedEditor().updateOptions({ readOnly: rightLocked });
+  };
 
   useEffect(() => {
     void refresh().catch(e => setError(errorText(e)));
@@ -291,7 +378,28 @@ function App() {
     const offClose = window.diffEditor.onBeforeClose(() => {
       void flushRef.current().then(() => window.diffEditor.readyToClose()).catch(e => setError(`无法关闭：草稿尚未缓存。${errorText(e)}。请重试缓存后再关闭。`));
     });
-    return () => { offChanged(); offSave(); offClose(); };
+    const offBeforeWithdraw = window.diffEditor.onBeforeWithdraw(({ token, reviewId }) => {
+      if (withdrawalLocks.current.has(token)) return;
+      withdrawalLocks.current.set(token, reviewId);
+      // Lock Monaco and action refs before yielding, including its undo commands.
+      syncEditorLock(); setWithdrawalCount(withdrawalLocks.current.size);
+      void flushReviewRef.current(reviewId).then(
+        () => { if (withdrawalLocks.current.has(token)) window.diffEditor.withdrawReady(token); },
+        e => { if (withdrawalLocks.current.has(token)) window.diffEditor.withdrawReady(token, errorText(e)); },
+      );
+    });
+    const offWithdrawFinished = window.diffEditor.onWithdrawFinished(({ token, reviewId, withdrawnAt }) => {
+      if (withdrawalLocks.current.get(token) !== reviewId) return;
+      if (withdrawnAt) {
+        // Publish the terminal state before releasing the last preflight lock.
+        merge(reviewsRef.current.map(r => r.id === reviewId ? { ...r, withdrawnAt,
+          ...(r.mode === 'proposal' && !isWithdrawn(r) ? { closedAt: r.closedAt || withdrawnAt, updatedAt: withdrawnAt } : {}),
+          targets: r.targets.map(t => ({ ...t, status: 'withdrawn' as const })) } : r));
+      }
+      withdrawalLocks.current.delete(token);
+      syncEditorLock(); setWithdrawalCount(withdrawalLocks.current.size);
+    });
+    return () => { offChanged(); offSave(); offClose(); offBeforeWithdraw(); offWithdrawFinished(); };
   }, [refresh]);
 
   useEffect(() => {
@@ -310,7 +418,7 @@ function App() {
       scrollbar: { verticalScrollbarSize: 6, horizontalScrollbarSize: 6, verticalSliderSize: 6, horizontalSliderSize: 6, useShadows: false },
     };
     const disposables = [left.onDidChangeContent(() => edit('left', left.getValue())), right.onDidChangeContent(() => edit('right', right.getValue()))];
-    setCurrentChunk(-1); setChanges([]); setChunkPositions([]); setHoveredChunk(undefined); setSaveEncoding({}); setRejecting(false);
+    setCurrentChunk(-1); setChanges([]); setChunkPositions([]); setHoveredChunk(undefined); setSaveEncoding({}); setRejecting(undefined);
     if (retainedSide) {
       const editor = monaco.editor.create(editorHost.current, { ...options, model: models.current[retainedSide], readOnly: true, scrollbar: { ...options.scrollbar, vertical: 'hidden', verticalScrollbarSize: 0 } });
       retainedEditorRef.current = editor;
@@ -321,7 +429,7 @@ function App() {
       return () => { disposables.forEach(d => d.dispose()); editor.setModel(null); editor.dispose(); left.dispose(); right.dispose(); models.current = undefined; retainedEditorRef.current = undefined; };
     }
     const diff = monaco.editor.createDiffEditor(editorHost.current, {
-      ...options, originalEditable: true, readOnly: false,
+      ...options, originalEditable: !withdrawalLocks.current.size && !isWithdrawn(currentReview) && !locked(targetFor(currentReview, 'left')), readOnly: !!withdrawalLocks.current.size || isWithdrawn(currentReview) || locked(targetFor(currentReview, 'right')),
       renderSideBySide: true, useInlineViewWhenSpaceIsLimited: false, ignoreTrimWhitespace: false,
       renderIndicators: true, renderMarginRevertIcon: false, renderGutterMenu: false, enableSplitViewResizing: false,
       hideUnchangedRegions: { enabled: fold, contextLineCount: 3, minimumLineCount: 6, revealLineCount: 10 },
@@ -338,9 +446,11 @@ function App() {
         const source = c.originalEndLineNumber ? original : modified;
         const start = c.originalEndLineNumber ? c.originalStartLineNumber : c.modifiedStartLineNumber;
         const end = c.originalEndLineNumber ? c.originalEndLineNumber : c.modifiedEndLineNumber;
-        const top = source.getTopForLineNumber(Math.max(1, start)) - source.getScrollTop();
-        const bottom = source.getBottomForLineNumber(Math.max(1, end)) - source.getScrollTop();
-        const modifiedBottom = c.modifiedEndLineNumber ? modified.getBottomForLineNumber(c.modifiedEndLineNumber) - modified.getScrollTop() : bottom;
+        // A synchronous preflight lock can relayout before Monaco refreshes its diff.
+        const sourceLine = (line: number) => Math.min(source.getModel()!.getLineCount(), Math.max(1, line));
+        const top = source.getTopForLineNumber(sourceLine(start)) - source.getScrollTop();
+        const bottom = source.getBottomForLineNumber(sourceLine(end)) - source.getScrollTop();
+        const modifiedBottom = c.modifiedEndLineNumber ? modified.getBottomForLineNumber(Math.min(modified.getModel()!.getLineCount(), c.modifiedEndLineNumber)) - modified.getScrollTop() : bottom;
         return { top, bottom: Math.max(bottom, modifiedBottom, top + 22) };
       }));
     };
@@ -370,7 +480,8 @@ function App() {
   });
   useEffect(() => {
     if (!review) return;
-    diffRef.current?.updateOptions({ originalEditable: !locked(targetFor(review, 'left')) && !blocked, readOnly: locked(targetFor(review, 'right')) || blocked, wordWrap: wrap ? 'on' : 'off', diffWordWrap: wrap ? 'on' : 'off', hideUnchangedRegions: { enabled: fold, contextLineCount: 3, minimumLineCount: 6, revealLineCount: 10 } });
+    const frozen = blocked || withdrawalLocks.current.size > 0 || isWithdrawn(reviewsRef.current.find(r => r.id === review.id));
+    diffRef.current?.updateOptions({ originalEditable: !reviewWithdrawn && !locked(targetFor(review, 'left')) && !frozen, readOnly: reviewWithdrawn || locked(targetFor(review, 'right')) || frozen, wordWrap: wrap ? 'on' : 'off', diffWordWrap: wrap ? 'on' : 'off', hideUnchangedRegions: { enabled: fold, contextLineCount: 3, minimumLineCount: 6, revealLineCount: 10 } });
     retainedEditorRef.current?.updateOptions({ readOnly: true, wordWrap: wrap ? 'on' : 'off' });
   }, [wrap, fold, review, blocked, retainedSide]);
 
@@ -383,7 +494,7 @@ function App() {
     diffRef.current?.getOriginalEditor().revealLineInCenter(Math.max(1, c.originalStartLineNumber));
   };
   const transfer = (index: number, from: Side) => {
-    if (!review || !models.current || blocked || retainedSide || !changes[index]) return;
+    if (!review || !models.current || withdrawalLocks.current.size || blocked || retainedSide || isWithdrawn(reviewsRef.current.find(r => r.id === review.id)) || !changes[index]) return;
     const to: Side = from === 'left' ? 'right' : 'left';
     if (locked(targetFor(review, to))) return;
     const model = models.current[to];
@@ -393,7 +504,7 @@ function App() {
     ed.focus(); setFocusSide(to);
   };
   const editorAction = (id: string) => {
-    if (blocked) return;
+    if (withdrawalLocks.current.size || blocked || (isWithdrawn(reviewsRef.current.find(r => r.id === selectedRef.current)) && (id === 'undo' || id === 'redo'))) return;
     const ed = retainedEditorRef.current || (focusSide === 'left' ? diffRef.current?.getOriginalEditor() : diffRef.current?.getModifiedEditor());
     ed?.focus();
     if (id === 'undo' || id === 'redo') ed?.trigger('toolbar', id, null);
@@ -438,43 +549,48 @@ function App() {
       <div className="queue-heading"><span>比较列表</span><span>{openReviews.length}</span></div>
       <nav className="review-list" aria-label="比较列表">{openReviews.map(r => {
         const statuses = r.targets.map(t => t.status);
-        const state = statuses.length && statuses.every(s => s === 'saved') ? 'saved' : statuses.length && statuses.every(s => s === 'rejected') ? 'rejected' : statuses.includes('conflict') ? 'conflict' : statuses.includes('error') ? 'error' : 'pending';
-        return <div key={r.id} className={`review-row ${selected === r.id ? 'selected' : ''}`}><button data-testid={`review-${r.id}`} className="review-item" disabled={blocked} onClick={() => void action(async () => { if (selected) await flushReview(selected); setSelected(r.id); })} title={r.targets.map(t => t.path).join('\n') || r.title}><span className="review-title">{r.title}</span><span className="review-detail"><i className={`status-dot ${state}`} />{r.mode === 'text' && !r.targets.length ? '文本草稿' : statusLabels[state]}<span>{r.mode === 'single' ? '单文件' : r.mode === 'pair' ? '双文件' : r.mode === 'text' ? '文本' : '修改提案'}</span></span></button><div className="review-row-actions"><button data-testid={`close-${r.id}`} disabled={blocked} onClick={() => closeReview(r.id)} aria-label={`关闭比较 ${r.title}`}>关闭</button><button data-testid={`delete-${r.id}`} disabled={blocked} onClick={() => requestDelete(r)} aria-label={`删除比较 ${r.title}`}>删除</button></div></div>;
+        const state = isWithdrawn(r) ? 'withdrawn' : statuses.length && statuses.every(s => s === 'saved') ? 'saved' : statuses.length && statuses.every(s => s === 'rejected') ? 'rejected' : statuses.includes('conflict') ? 'conflict' : statuses.includes('error') ? 'error' : 'pending';
+        return <div key={r.id} className={`review-row ${selected === r.id ? 'selected' : ''}`}><button data-testid={`review-${r.id}`} className="review-item" disabled={blocked} onClick={() => void action(async () => { if (selected) await flushReview(selected); setSelected(r.id); })} title={r.targets.map(t => t.path).join('\n') || r.title}><span className="review-title-line"><span className="review-title">{r.title}</span>{r.mode === 'proposal' && <span className="source-badge" data-testid={`source-badge-${r.id}`}>{r.source?.agent || 'Codex'}</span>}</span><span className="review-detail"><i className={`status-dot ${state}`} />{r.mode === 'text' && !r.targets.length ? '文本草稿' : statusLabels[state]}<span>{r.mode === 'single' ? '单文件' : r.mode === 'pair' ? '双文件' : r.mode === 'text' ? '文本' : '修改提案'}</span></span></button><div className="review-row-actions"><button data-testid={`close-${r.id}`} disabled={blocked} onClick={() => closeReview(r.id)} aria-label={`关闭比较 ${r.title}`}>关闭</button></div></div>;
       })}
-      {!!closedReviews.length && <><div className="closed-controls"><button className="closed-heading" data-testid="toggle-closed" aria-expanded={showClosed} onClick={() => setShowClosed(!showClosed)}>已关闭 <span>{closedReviews.length}</span></button><button className="delete-closed" data-testid="delete-closed" disabled={blocked} onClick={requestDeleteClosed} aria-label="删除全部已关闭比较">删除全部</button></div>{showClosed && closedReviews.map(r => <div key={r.id} className="review-row closed-review" data-testid={`closed-${r.id}`}><span className="review-title" title={r.title}>{r.title}</span><div className="review-row-actions"><button data-testid={`reopen-${r.id}`} disabled={blocked} onClick={() => reopenReview(r.id)}>重新打开</button><button data-testid={`delete-${r.id}`} disabled={blocked} onClick={() => requestDelete(r)} aria-label={`删除比较 ${r.title}`}>删除</button></div></div>)}</>}
+      {!!closedReviews.length && <><div className="closed-controls"><button className="closed-heading" data-testid="toggle-closed" aria-expanded={showClosed} onClick={() => setShowClosed(!showClosed)}>已关闭 <span>{closedReviews.length}</span></button><button className="delete-closed" data-testid="delete-closed" disabled={blocked} onClick={requestDeleteClosed} aria-label="删除全部已关闭比较">删除全部</button></div>{showClosed && closedReviews.map(r => <div key={r.id} className="review-row closed-review" data-testid={`closed-${r.id}`}><span className="review-title-line"><span className="review-title" title={r.title}>{r.title}</span>{r.mode === 'proposal' && <span className="source-badge" data-testid={`source-badge-${r.id}`}>{r.source?.agent || 'Codex'}</span>}</span><div className="review-row-actions">{proposalCompletionAt(r) && <span className={`closed-completion ${isWithdrawn(r) ? 'withdrawn' : 'saved'}`} data-testid={`completion-${r.id}`}>{isWithdrawn(r) ? 'AI 已撤回' : '已通过'}</span>}<button data-testid={`reopen-${r.id}`} disabled={blocked} onClick={() => reopenReview(r.id)}>重新打开</button><button data-testid={`delete-${r.id}`} disabled={blocked} onClick={() => requestDelete(r)} aria-label={`删除比较 ${r.title}`}>删除</button></div></div>)}</>}
       </nav>
       <Settings disabled={blocked} />
       <div className="sidebar-foot"><span className="privacy-dot" />文件始终保存在本机</div>
     </aside>
     <main className="workspace">
-      <header className="toolbar"><div className="toolbar-title">{review?.title || '文本比较'}</div><div className="toolbar-actions"><button title="撤销（Ctrl+Z）" disabled={!review || !!retainedSide} onClick={() => editorAction('undo')}>撤销</button><button title="重做（Ctrl+Y）" disabled={!review || !!retainedSide} onClick={() => editorAction('redo')}>重做</button><span className="separator" /><button title="查找（Ctrl+F）" disabled={!review} onClick={() => editorAction('actions.find')}>查找</button><button data-testid="toggle-wrap" className={wrap ? 'active' : ''} onClick={() => setWrap(!wrap)}>自动换行</button>{!retainedSide && <><button data-testid="toggle-fold" className={fold ? 'active' : ''} onClick={() => setFold(!fold)}>折叠相同</button><span className="separator" /><button aria-label="上一处差异" disabled={!changes.length} onClick={() => navigate(-1)}>↑</button><span className="diff-count" data-testid="diff-count">{changes.length ? `${currentChunk < 0 ? '—' : currentChunk + 1} / ${changes.length}` : '0 处差异'}</span><button aria-label="下一处差异" disabled={!changes.length} onClick={() => navigate(1)}>↓</button></>}</div></header>
-      {error && !deletePrompt && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="关闭错误提示" onClick={() => setError('')}>×</button></div>}
+      <header className="toolbar"><div className="toolbar-title">{review?.title || '文本比较'}</div><div className="toolbar-actions"><button title="撤销（Ctrl+Z）" disabled={!review || !!retainedSide || reviewWithdrawn || blocked} onClick={() => editorAction('undo')}>撤销</button><button title="重做（Ctrl+Y）" disabled={!review || !!retainedSide || reviewWithdrawn || blocked} onClick={() => editorAction('redo')}>重做</button><span className="separator" /><button title="查找（Ctrl+F）" disabled={!review} onClick={() => editorAction('actions.find')}>查找</button><button data-testid="toggle-wrap" className={wrap ? 'active' : ''} onClick={() => setWrap(!wrap)}>自动换行</button>{!retainedSide && <><button data-testid="toggle-fold" className={fold ? 'active' : ''} onClick={() => setFold(!fold)}>折叠相同</button><span className="separator" /><button aria-label="上一处差异" disabled={!changes.length} onClick={() => navigate(-1)}>↑</button><span className="diff-count" data-testid="diff-count">{changes.length ? `${currentChunk < 0 ? '—' : currentChunk + 1} / ${changes.length}` : '0 处差异'}</span><button aria-label="下一处差异" disabled={!changes.length} onClick={() => navigate(1)}>↓</button></>}</div></header>
+      {review?.mode === 'proposal' && <div className="review-source" data-testid="review-source"><span className="source-badge">{review.source?.agent || 'Codex'}</span><div className="source-conversation">{review.source?.threadTitle && <span data-testid="source-thread-title">发起对话：{review.source.threadTitle}</span>}{review.source?.threadId && <span className="source-thread-id" data-testid="source-thread-id">对话 ID：{review.source.threadId}</span>}{!review.source?.threadTitle && !review.source?.threadId && <span data-testid="source-thread-unknown">来源对话未记录</span>}</div></div>}
+      {reviewWithdrawn && <div className="withdrawal-notice" role="status" data-testid="withdrawal-notice"><strong>AI 已撤回</strong><span>本轮审阅已结束，原文件未改动。草稿与历史记录已保留，可查看、复制，或手动关闭比较。</span></div>}
+      {error && !deletePrompt && !rejecting && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="关闭错误提示" onClick={() => setError('')}>×</button></div>}
       {review ? <>
         <div className={`pane-headers ${retainedSide ? 'retained-view' : ''}`} data-testid={retainedSide ? 'retained-view' : 'comparison-view'}>{(retainedSide ? [retainedSide] : sides).map(side => {
           const target = targetFor(review, side), draft = drafts.current.get(keyFor(review.id, side));
+          const returnAction = review.mode === 'proposal' && side === 'left';
+          const actionDisabled = reviewWithdrawn || (returnAction ? review.targets.every(t => locked(t)) || !!retainedSide : !canSave(target));
           const aiDraft = review.mode === 'proposal' && side === 'right' && target?.status !== 'saved';
-          const pathText = target ? (aiDraft ? `AI 提供的草稿，确认后保存至：${target.path}` : target.path) : '保存时选择文件位置';
+          const pathText = target ? (aiDraft ? reviewWithdrawn ? `已撤回的 AI 草稿，原目标文件：${target.path}` : `AI 提供的草稿，确认后保存至：${target.path}` : target.path) : '保存时选择文件位置';
           const lineCount = models.current?.[side].getLineCount() ?? draft?.text.split('\n').length ?? 0;
           const changedLines = changes.reduce((total, change) => {
             const start = side === 'left' ? change.originalStartLineNumber : change.modifiedStartLineNumber;
             const end = side === 'left' ? change.originalEndLineNumber : change.modifiedEndLineNumber;
             return total + (end === 0 ? 0 : end - start + 1);
           }, 0);
-          return <section key={side} className={`pane-header ${focusSide === side ? 'focused' : ''}`}><div className="pane-heading"><span className="side-label">{labels[side]}</span><strong title={target?.path}>{target ? basename(target.path) : `${versionNames[side]}文本`}</strong><span className={`formal-state ${target?.status || 'pending'}`}>{target ? statusLabels[target.status] : '未关联文件'}</span></div><div className={`pane-path ${aiDraft ? 'ai-draft-path' : ''}`} data-testid={`pane-path-${side}`} title={pathText}>{pathText}</div><div className="pane-controls"><span data-testid={`draft-status-${side}`} className={`draft-status ${draft?.state}`}>{draft?.state === 'caching' ? '草稿缓存中…' : draft?.state === 'error' ? '草稿缓存失败' : '草稿已缓存'}</span><span className="pane-metrics"><span data-testid={`line-count-${side}`}>{lineCount.toLocaleString()} 行</span><span data-testid={`change-count-${side}`} className={side === 'left' ? 'deleted' : 'added'}>{side === 'left' ? '−' : '+'}{changedLines.toLocaleString()} 行</span></span>{draft?.state === 'error' && <button className="text-button" onClick={() => void action(() => flushPane(review.id, side))}>重试</button>}<div className="pane-save"><select data-testid={`save-encoding-${side}`} aria-label={`${labels[side]}保存编码`} disabled={blocked || !canSave(target)} value={saveEncoding[side] || target?.encoding || 'utf8'} onChange={e => setSaveEncoding(current => ({ ...current, [side]: e.target.value as TextEncoding }))}>{Object.entries(encodings).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><button data-testid={`save-${side}`} className="save-button" disabled={blocked || !canSave(target)} onClick={() => void saveSide(side)}>{isUncreatedText(review, target) ? '另存为…' : `保存${versionNames[side]}`}</button></div></div>{(draft?.error || target?.error) && <div className="pane-error" role="alert">{draft?.error || target?.error}</div>}{target?.receipt && <div className="receipt">已保存 {new Date(target.receipt.savedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}{target.receipt.backupPath && <button className="text-button" onClick={() => void action(async () => { await window.diffEditor.showInFolder(target.receipt!.backupPath!); })}>查看备份</button>}<button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>继续编辑</button></div>}{(target?.status === 'conflict' || target?.status === 'error') && <div className="recovery"><span>当前草稿已保留，重新读取磁盘文件后继续审核。</span><button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>基于磁盘继续</button></div>}</section>;
+          return <section key={side} className={`pane-header ${focusSide === side ? 'focused' : ''}`}><div className="pane-heading"><span className="side-label">{labels[side]}</span><strong title={target?.path}>{target ? basename(target.path) : `${versionNames[side]}文本`}</strong><span className={`formal-state ${target?.status || 'pending'}`}>{target ? statusLabels[target.status] : '未关联文件'}</span></div><div className={`pane-path ${aiDraft ? 'ai-draft-path' : ''}`} data-testid={`pane-path-${side}`} title={pathText}>{pathText}</div><div className="pane-controls"><span data-testid={`draft-status-${side}`} className={`draft-status ${draft?.state}`}>{draft?.state === 'caching' ? '草稿缓存中…' : draft?.state === 'error' ? '草稿缓存失败' : '草稿已缓存'}</span><span className="pane-metrics"><span data-testid={`line-count-${side}`}>{lineCount.toLocaleString()} 行</span><span data-testid={`change-count-${side}`} className={side === 'left' ? 'deleted' : 'added'}>{side === 'left' ? '−' : '+'}{changedLines.toLocaleString()} 行</span></span>{draft?.state === 'error' && <button className="text-button" onClick={() => void action(() => flushPane(review.id, side))}>重试</button>}<div className="pane-save">{!returnAction && <select data-testid={`save-encoding-${side}`} aria-label={`${labels[side]}保存编码`} disabled={blocked || reviewWithdrawn || !canSave(target)} value={saveEncoding[side] || target?.encoding || 'utf8'} onChange={e => setSaveEncoding(current => ({ ...current, [side]: e.target.value as TextEncoding }))}>{Object.entries(encodings).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>}<button data-testid={`save-${side}`} className={returnAction ? "return-button" : review.mode === "proposal" ? "save-button approve-button" : "save-button"} disabled={blocked || actionDisabled} onClick={() => void saveSide(side)}>{review.mode === 'proposal' ? (returnAction ? '退回' : '通过') : isUncreatedText(review, target) ? '另存为…' : `保存${versionNames[side]}`}</button></div></div>{(draft?.error || target?.error) && <div className="pane-error" role="alert">{draft?.error || target?.error}</div>}{target?.receipt && <div className="receipt">已保存 {new Date(target.receipt.savedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}{target.receipt.backupPath && <button className="text-button" onClick={() => void action(async () => { await window.diffEditor.showInFolder(target.receipt!.backupPath!); })}>查看备份</button>}<button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>继续编辑</button></div>}{(target?.status === 'conflict' || target?.status === 'error') && <div className="recovery"><span>当前草稿已保留，重新读取磁盘文件后继续审核。</span><button data-testid={`continue-${side}`} className="text-button" disabled={blocked} onClick={() => void action(async () => { await flushReview(review.id); const next = await window.diffEditor.continueTarget(review.id, target.id); await refresh(); setSelected(next.id); })}>基于磁盘继续</button></div>}</section>;
         })}</div>
         <div className="editor-stage" data-testid="editor-stage" onPointerMove={hoverChunk} onPointerDown={e => { if (!(e.target instanceof Element) || !e.target.closest('[data-chunk-index]')) setHoveredChunk(undefined); }} onPointerLeave={() => setHoveredChunk(undefined)} onWheel={() => setHoveredChunk(undefined)}>
           <div className="editor-host" data-testid={retainedSide ? 'retained-editor' : 'diff-editor'} ref={editorHost} />
           {!retainedSide && <div className="chunk-rail" aria-label="逐块替换">{changes.map((_, index) => <div key={index} className="chunk-actions" style={{ top: (chunkPositions[index]?.bottom ?? 0) > 0 ? Math.max(0, chunkPositions[index].top) : -1000 }}>
-            {sides.map(to => <button key={to} className={`chunk-action to-${to} ${hoveredChunk?.index === index && hoveredChunk.to === to ? 'is-visible' : ''}`} data-testid={`chunk-to-${to}-${index}`} data-chunk-index={index} data-to={to} aria-label={`第 ${index + 1} 处${to === 'left' ? '用新稿替换原稿' : '用原稿替换新稿'}`} title={to === 'left' ? '用新稿替换原稿此处' : '用原稿替换新稿此处'} disabled={locked(targetFor(review, to)) || blocked} onClick={() => transfer(index, to === 'left' ? 'right' : 'left')}><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={to === 'left' ? 'M19 12H5m5-5-5 5 5 5' : 'M5 12h14m-5-5 5 5-5 5'} /></svg></button>)}
+            {sides.map(to => <button key={to} className={`chunk-action to-${to} ${hoveredChunk?.index === index && hoveredChunk.to === to ? 'is-visible' : ''}`} data-testid={`chunk-to-${to}-${index}`} data-chunk-index={index} data-to={to} aria-label={`第 ${index + 1} 处${to === 'left' ? '用新稿替换原稿' : '用原稿替换新稿'}`} title={to === 'left' ? '用新稿替换原稿此处' : '用原稿替换新稿此处'} disabled={reviewWithdrawn || locked(targetFor(review, to)) || blocked} onClick={() => transfer(index, to === 'left' ? 'right' : 'left')}><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={to === 'left' ? 'M19 12H5m5-5-5 5 5 5' : 'M5 12h14m-5-5 5 5-5 5'} /></svg></button>)}
           </div>)}</div>}
           <TextOverview diff={diffRef.current} editor={retainedEditorRef.current} changes={changes} originalText={drafts.current.get(keyFor(review.id, 'left'))?.text || ''} modifiedText={drafts.current.get(keyFor(review.id, 'right'))?.text || ''} retainedSide={retainedSide} />
         </div>
-        <footer className="statusbar"><span>{retainedSide ? '已保存内容' : <><i className="diff-key removed" />删除<i className="diff-key added" />新增<span className="status-note">实时比较 · 包含空白差异</span></>}</span><div>{retainedSide && retainedReceipt && hasOtherUnfinishedFile(review, retainedReceipt) && <button data-testid="resume-comparison" disabled={blocked} onClick={() => setComparisonOverrides(current => ({ ...current, [review.id]: retainedReceipt.operationId }))}>继续审阅另一文件</button>}{!retainedSide && (rejecting ? <><span>退回后保留审核历史</span><button data-testid="confirm-reject" disabled={busy} onClick={() => void action(async () => { await flushReview(review.id); await window.diffEditor.rejectReview(review.id); setRejecting(false); await refresh(); }, true)}>确认退回</button><button disabled={busy} onClick={() => setRejecting(false)}>取消</button></> : review.mode !== 'text' && <button data-testid="reject-review" disabled={blocked || review.targets.every(t => locked(t))} onClick={() => setRejecting(true)}>退回审核</button>)}<span>{labels[retainedSide || focusSide]}{retainedSide || locked(targetFor(review, focusSide)) ? '已锁定' : '正在编辑'}</span></div></footer>
+        <footer className="statusbar"><span>{retainedSide ? '已保存内容' : <><i className="diff-key removed" />删除<i className="diff-key added" />新增<span className="status-note">实时比较 · 包含空白差异</span></>}</span><div>{retainedSide && retainedReceipt && hasOtherUnfinishedFile(review, retainedReceipt) && <button data-testid="resume-comparison" disabled={blocked} onClick={() => setComparisonOverrides(current => ({ ...current, [review.id]: retainedReceipt.operationId }))}>继续审阅另一文件</button>}{!retainedSide && review.mode !== 'text' && review.mode !== 'proposal' && <button data-testid="reject-review" disabled={blocked || review.targets.every(t => locked(t))} onClick={() => requestReject(review)}>退回审核</button>}<span>{labels[retainedSide || focusSide]}{retainedSide || reviewWithdrawn || locked(targetFor(review, focusSide)) ? '已锁定' : '正在编辑'}</span></div></footer>
       </> : <div className="empty-state"><div className="empty-symbol">⇄</div><h1>逐处比较和编辑文本</h1><p>两侧都可以编辑。草稿自动缓存，文件由你确认后保存。</p><div className="empty-buttons"><button data-testid="empty-new-text" className="primary" disabled={blocked} onClick={createText}>新建文本比较</button><button disabled={blocked} onClick={() => open('single')}>打开文件</button><button disabled={blocked} onClick={() => open('pair')}>比较两个文件</button></div><div className="empty-drop"><span>也可以将文本文件拖到这里</span></div><div className="cli-hint"><strong>接收 Agent 修改</strong><p>使用随附的 diffeditor 命令提交修改提案，在这里审核并保存。</p><code>diffeditor baseline paper.tex</code></div></div>}
     </main>
     {dragging && <div className="drop-overlay" onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false); }} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); setDragging(false); }}><div className="drop-choice" data-testid="drop-single" onDrop={e => drop(e, 'single')}><strong>单文件编辑</strong><span>每个文件各开一项审核，两侧从相同内容开始</span></div><div className="drop-choice" data-testid="drop-pair" onDrop={e => drop(e, 'pair')}><strong>双文件比较</strong><span>拖入两个文件，原稿与新稿分别保存</span></div></div>}
-    {deletePrompt && <div className="modal-backdrop"><section className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" data-testid="delete-dialog"><h2 id="delete-dialog-title">{deletePrompt.closedOnly ? `删除全部 ${deletePrompt.reviews.length} 项已关闭比较？` : '删除比较？'}</h2>{deletePrompt.closedOnly ? <ul className="delete-review-list">{deletePrompt.reviews.map(r => <li key={r.id}>{r.title}</li>)}</ul> : <p className="delete-title">{deletePrompt.reviews[0].title}</p>}<p>这将删除应用中的{deletePrompt.closedOnly ? '这些比较' : '这项比较'}和两侧缓存草稿，无法恢复。真实文件及备份文件不会删除。</p>{error && <p role="alert" className="pane-error">{error}</p>}<footer><button data-testid="cancel-delete" autoFocus disabled={busy} onClick={() => setDeletePrompt(undefined)}>取消</button><button data-testid="confirm-delete" disabled={busy} onClick={confirmDelete}>{busy ? '正在删除…' : deletePrompt.closedOnly ? `删除这 ${deletePrompt.reviews.length} 项` : '删除比较'}</button></footer></section></div>}
-    {preview && <div className="modal-backdrop"><section className="save-dialog" role="dialog" aria-modal="true" aria-labelledby="save-dialog-title" data-testid="save-dialog"><header><h2 id="save-dialog-title">确认保存{labels[preview.preview.side]}</h2><button data-testid="cancel-save" aria-label="取消保存" disabled={busy} onClick={() => setPreview(undefined)}>×</button></header><dl className="save-details"><dt>目标文件</dt><dd data-testid="preview-target">{preview.preview.targetPath}</dd><dt>备份文件</dt><dd data-testid="preview-backup">{preview.preview.backupPath || (preview.preview.isNew ? '新建文件，无旧文件需要备份' : '没有备份路径')}</dd><dt>文件编码</dt><dd>{encodings[preview.preview.encoding]}</dd></dl><div className="preview-caption">本次将写入的完整内容<span>{preview.text.length.toLocaleString()} 个字符</span></div><pre data-testid="preview-text" className="frozen-text">{preview.text || <span className="muted">（空文件）</span>}</pre><footer><span>确认后写入目标文件；已有内容先备份。</span><button disabled={busy} onClick={() => setPreview(undefined)}>取消</button><button data-testid="confirm-save" className="primary" disabled={busy} onClick={() => void action(async () => { try { await window.diffEditor.commitSave(preview.preview.token); } catch (e) { setPreview(undefined); await refresh(); throw e; } setPreview(undefined); await refresh(); }, true)}>{busy ? '正在保存…' : '确认并保存'}</button></footer></section></div>}
+    {rejecting && <div className="modal-backdrop"><section ref={rejectDialog} className="delete-dialog reject-dialog" role="dialog" aria-modal="true" aria-labelledby="reject-dialog-title" aria-describedby="reject-dialog-description" data-testid="reject-dialog"><header><h2 id="reject-dialog-title">退回这份修改？</h2><button aria-label="取消退回" disabled={modalBlocked} onClick={cancelReject}>×</button></header><p className="delete-title">{rejecting.title}</p><p id="reject-dialog-description">退回后，本轮审阅结束，原文件保持不变。草稿和审核记录会保留。</p>{error && <div className="pane-error" role="alert">{error}</div>}<footer><button data-testid="cancel-reject" disabled={modalBlocked} onClick={cancelReject}>取消</button><button data-testid="confirm-reject" className="return-button" disabled={modalBlocked} onClick={() => void action(async () => { await flushReview(rejecting.id); if (isWithdrawn(reviewsRef.current.find(r => r.id === rejecting.id))) { setRejecting(undefined); return; } await window.diffEditor.rejectReview(rejecting.id); setRejecting(undefined); await refresh(); }, true)}>{busy ? '正在退回…' : '确认退回'}</button></footer></section></div>}
+    {deletePrompt && <div className="modal-backdrop"><section className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" data-testid="delete-dialog"><h2 id="delete-dialog-title">{deletePrompt.closedOnly ? `删除全部 ${deletePrompt.reviews.length} 项已关闭比较？` : '删除比较？'}</h2>{deletePrompt.closedOnly ? <ul className="delete-review-list">{deletePrompt.reviews.map(r => <li key={r.id}>{r.title}</li>)}</ul> : <p className="delete-title">{deletePrompt.reviews[0].title}</p>}<p>这将删除应用中的{deletePrompt.closedOnly ? '这些比较' : '这项比较'}和两侧缓存草稿，无法恢复。真实文件及备份文件不会删除。</p>{error && <p role="alert" className="pane-error">{error}</p>}<footer><button data-testid="cancel-delete" autoFocus disabled={modalBlocked} onClick={() => { if (!withdrawalLocks.current.size) setDeletePrompt(undefined); }}>取消</button><button data-testid="confirm-delete" disabled={modalBlocked} onClick={confirmDelete}>{busy ? '正在删除…' : deletePrompt.closedOnly ? `删除这 ${deletePrompt.reviews.length} 项` : '删除比较'}</button></footer></section></div>}
+    {preview && <div className="modal-backdrop"><section className="save-dialog" role="dialog" aria-modal="true" aria-labelledby="save-dialog-title" data-testid="save-dialog"><header><h2 id="save-dialog-title">{review?.mode === 'proposal' ? '确认通过并保存新稿' : `确认保存${labels[preview.preview.side]}`}</h2><button data-testid="cancel-save" aria-label="取消保存" disabled={modalBlocked} onClick={() => { if (!withdrawalLocks.current.size) setPreview(undefined); }}>×</button></header><dl className="save-details"><dt>目标文件</dt><dd data-testid="preview-target">{preview.preview.targetPath}</dd><dt>备份文件</dt><dd data-testid="preview-backup">{preview.preview.backupPath || (preview.preview.isNew ? '新建文件，无旧文件需要备份' : '没有备份路径')}</dd><dt>文件编码</dt><dd>{encodings[preview.preview.encoding]}</dd></dl><div className="preview-caption">本次将写入的完整内容<span>{preview.text.length.toLocaleString()} 个字符</span></div><pre data-testid="preview-text" className="frozen-text">{preview.text || <span className="muted">（空文件）</span>}</pre><footer><span>确认后写入目标文件；已有内容先备份。</span><button disabled={modalBlocked} onClick={() => { if (!withdrawalLocks.current.size) setPreview(undefined); }}>取消</button><button data-testid="confirm-save" className={review?.mode === "proposal" ? "primary approve-button" : "primary"} disabled={modalBlocked} onClick={() => void action(async () => { try { await window.diffEditor.commitSave(preview.preview.token); } catch (e) { setPreview(undefined); await refresh(); throw e; } setPreview(undefined); await refresh(); }, true)}>{busy ? '正在保存…' : review?.mode === 'proposal' ? '确认通过并保存' : '确认并保存'}</button></footer></section></div>}
   </div>;
 }
 

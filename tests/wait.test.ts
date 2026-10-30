@@ -60,9 +60,9 @@ test('wait observes durable completion only, with the actual user side, edited b
   const count = subscriptions(store);
   const waiting = waitForReviews(store, { reviewIds: [reviewId], timeoutMs: 1500 });
   await pending(waiting);
-  await store.updateDraft({ reviewId, side: 'left', text: '用户实际选择\n手工修改\n', expectedRevision: 0 });
+  await store.updateDraft({ reviewId, side: 'right', text: '用户实际选择\n手工修改\n', expectedRevision: 0 });
   await pending(waiting);
-  const preview = await store.prepareSave({ reviewId, side: 'left', expectedRevision: 1 });
+  const preview = await store.prepareSave({ reviewId, side: 'right', expectedRevision: 1 });
   await pending(waiting);
   const committing = store.commitSave(preview.token);
   try {
@@ -74,7 +74,7 @@ test('wait observes durable completion only, with the actual user side, edited b
   const receipt = await committing, result = await waiting;
   assert.equal(result.reason, 'saved');
   assert.deepEqual(result.reviews[0].targets[0].receipt, receipt);
-  assert.equal(receipt.side, 'left');
+  assert.equal(receipt.side, 'right');
   assert.equal(hash(await fs.readFile(target)), receipt.afterHash);
   assert.deepEqual(await fs.readFile(receipt.backupPath!), original);
   const durable = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
@@ -82,12 +82,12 @@ test('wait observes durable completion only, with the actual user side, edited b
   assert.equal(count(), 0);
 });
 
-test('saved receipts are available before wait, after restart, close and deletion without another write', async t => {
+test('saved receipts are available after auto-close, restart, reopening and deletion without another write', async t => {
   const { store, reviewId, dataDir, target } = await fixture(t);
   const receipt = await save(store, reviewId);
-  for (const lifecycle of ['open', 'closed', 'deleted'] as const) {
-    if (lifecycle === 'closed') await store.setReviewClosed(reviewId, true);
-    if (lifecycle === 'deleted') await store.deleteReview(reviewId);
+  for (const lifecycle of ['closed', 'open', 'deleted'] as const) {
+    if (lifecycle === 'open') await store.setReviewClosed(reviewId, false);
+    if (lifecycle === 'deleted') { await store.setReviewClosed(reviewId, true); await store.deleteReview(reviewId); }
     const recovered = new ReviewStore({ dataDir }); await recovered.init();
     const before = await fs.readFile(path.join(dataDir, 'state.json'));
     const bytes = await fs.readFile(target);
@@ -145,19 +145,28 @@ test('a pair requires every target receipt; a text comparison with no targets ca
   assert.equal((await waitForReviews(store, { reviewIds: [text.id], timeoutMs: 30 })).reason, 'timeout');
 });
 
-for (const action of ['reject', 'close', 'delete'] as const) test(`incomplete ${action} wakes wait with attention and its persisted lifecycle`, async t => {
+for (const action of ['reject', 'close'] as const) test(`incomplete ${action} wakes wait with attention and its persisted lifecycle`, async t => {
   const { store, reviewId, target } = await fixture(t);
   const bytes = await fs.readFile(target), count = subscriptions(store);
   const waiting = waitForReviews(store, { reviewIds: [reviewId], timeoutMs: 1000 });
   if (action === 'reject') await store.rejectReview(reviewId);
   if (action === 'close') await store.setReviewClosed(reviewId, true);
-  if (action === 'delete') await store.deleteReview(reviewId);
   const result = await waiting;
   assert.equal(result.reason, 'attention');
-  assert.equal(result.reviews[0].lifecycle, action === 'close' ? 'closed' : action === 'delete' ? 'deleted' : 'open');
+  assert.equal(result.reviews[0].lifecycle, action === 'close' ? 'closed' : 'open');
   assert.equal(result.reviews[0].targets[0].status, action === 'reject' ? 'rejected' : 'pending');
   assert.deepEqual(await fs.readFile(target), bytes);
   assert.equal(count(), 0);
+});
+
+test('an incomplete comparison deleted after closing returns persisted attention without changing its file', async t => {
+  const { store, reviewId, target, dataDir } = await fixture(t), bytes = await fs.readFile(target);
+  await store.setReviewClosed(reviewId, true); await store.deleteReview(reviewId);
+  const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
+  const result = await waitForReviews(reloaded, { reviewIds: [reviewId], timeoutMs: 100 });
+  assert.equal(result.reason, 'attention'); assert.equal(result.reviews[0].lifecycle, 'deleted');
+  assert.equal(result.reviews[0].targets[0].status, 'pending');
+  assert.deepEqual(await fs.readFile(target), bytes);
 });
 
 for (const failure of ['error', 'conflict'] as const) test(`save ${failure} returns attention without inventing a receipt`, async t => {

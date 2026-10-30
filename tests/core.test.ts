@@ -92,12 +92,47 @@ test('idempotent submit binds exact payload and rejects active draft collisions'
   const first = await store.submit(request); assert.equal(first.duplicate, false);
   await store.updateDraft({ reviewId: first.reviewIds[0], side: 'right', text: 'user draft', expectedRevision: 0 });
   const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
-  const replay = await reloaded.submit(request); assert.equal(replay.duplicate, true); assert.deepEqual(first.reviewIds, replay.reviewIds);
+  const replay = await reloaded.submit({ ...request, source: { agent: 'Codex', threadId: 'later-cli-origin' } }); assert.equal(replay.duplicate, true); assert.deepEqual(first.reviewIds, replay.reviewIds);
+  assert.equal(reloaded.list().reviews[0].source, undefined);
   assert.equal(reloaded.list().reviews[0].right.text, 'user draft');
   await assert.rejects(reloaded.submit({ ...request, title: 'different' }), /用于不同内容/);
   await assert.rejects(reloaded.submit({ ...request, requestId: 'request-two' }), /已有待处理审查/);
   await reloaded.rejectReview(first.reviewIds[0]);
-  assert.equal((await reloaded.submit({ ...request, requestId: 'request-three' })).duplicate, false);
+  await assert.rejects(reloaded.submit({ ...request, requestId: 'request-three' }), { code: 'BASELINE_EXPIRED' });
+  const refreshed = await reloaded.baseline({ paths: [target] });
+  assert.equal((await reloaded.submit({ ...request, requestId: 'request-three', files: [{ baselineId: refreshed.files[0].id, text: 'new proposal' }] })).duplicate, false);
+});
+
+test('proposal-left prepares and legacy pending left tokens cannot write, while right saves remain verified', async t => {
+  const { store, target, dataDir } = await fixture(t), review = await open(store, target), original = await fs.readFile(target);
+  await store.updateDraft({ reviewId: review.id, side: 'left', text: 'left draft', expectedRevision: 0 });
+  await store.updateDraft({ reviewId: review.id, side: 'right', text: 'right candidate', expectedRevision: 0 });
+  // A prepared left token from an older version must not bypass the current proposal action.
+  const legacy = await store.prepareSave({ reviewId: review.id, side: 'left', expectedRevision: 1 });
+  const statePath = path.join(dataDir, 'state.json'), state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.reviews[0].mode = 'proposal'; await fs.writeFile(statePath, JSON.stringify(state));
+  const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
+  const before = reloaded.list(), cache = await fs.readFile(statePath);
+  await assert.rejects(reloaded.prepareSave({ reviewId: review.id, side: 'left', expectedRevision: 1 }), /原稿仅支持退回/);
+  await assert.rejects(reloaded.commitSave(legacy.token), /原稿仅支持退回/);
+  assert.deepEqual(reloaded.list(), before); assert.deepEqual(await fs.readFile(statePath), cache); assert.deepEqual(await fs.readFile(target), original);
+  await assert.rejects(fs.stat(path.dirname(legacy.backupPath!)), { code: 'ENOENT' });
+  const right = await reloaded.prepareSave({ reviewId: review.id, side: 'right', expectedRevision: 1 }), receipt = await reloaded.commitSave(right.token);
+  assert.equal(receipt.side, 'right'); assert.equal(decode(await fs.readFile(target)).text, 'right candidate');
+  assert.deepEqual(await fs.readFile(receipt.backupPath!), original);
+});
+
+test('legacy completed proposal-left receipts remain valid history after restart', async t => {
+  const { store, target, dataDir } = await fixture(t), review = await open(store, target);
+  await store.updateDraft({ reviewId: review.id, side: 'left', text: 'legacy saved left', expectedRevision: 0 });
+  const preview = await store.prepareSave({ reviewId: review.id, side: 'left', expectedRevision: 1 }), receipt = await store.commitSave(preview.token);
+  const statePath = path.join(dataDir, 'state.json'), state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.reviews[0].mode = 'proposal'; await fs.writeFile(statePath, JSON.stringify(state));
+  const before = await fs.readFile(target), backup = await fs.readFile(receipt.backupPath!);
+  const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
+  assert.deepEqual(reloaded.status(review.id).reviews[0].targets[0].receipt, receipt);
+  assert.deepEqual(await reloaded.commitSave(preview.token), receipt);
+  assert.deepEqual(await fs.readFile(target), before); assert.deepEqual(await fs.readFile(receipt.backupPath!), backup);
 });
 
 test('pair targets complete independently; same-path pair shares one frozen target', async t => {

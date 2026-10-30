@@ -10,7 +10,7 @@ import { build } from 'esbuild';
 import { ReviewStore } from '../src/core/store';
 import { createPipeServer } from '../src/main/server';
 
-test('AI skill helper submits through the real pipe without approving, writing, or resurrecting deleted reviews', { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
+test('AI skill helper submits and withdraws through the real pipe without approving, writing, or resurrecting deleted reviews', { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
   const repo = path.resolve('.'), python = process.env.DIFFEDITOR_TEST_PYTHON || 'python';
   const helper = path.join(repo, 'skills', 'diffeditor', 'scripts', 'invoke_diffeditor.py');
   await fs.access(helper);
@@ -71,6 +71,20 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   assert.equal(timedOut.code, 0); assert.equal(timedOut.value.reason, 'timeout');
   assert.equal(timedOut.value.reviews[0].targets[0].receipt, undefined);
   assert.deepEqual(await fs.readFile(target), original);
+  const wrongOwner = await invoke(['withdraw', reviewId, '--request-id', 'unrelated-request']);
+  assert.equal(wrongOwner.code, 1); assert.equal(wrongOwner.value.code, 'WITHDRAW_NOT_OWNER');
+  assert.equal(store.list().reviews[0].targets[0].status, 'pending');
+  const withdrawn = await invoke(['withdraw', reviewId, '--request-id', candidate.requestId]);
+  assert.equal(withdrawn.code, 0); assert.equal(withdrawn.stderr, ''); assert.equal(withdrawn.value.status, 'withdrawn');
+  assert.equal(withdrawn.value.duplicate, false); assert.equal(withdrawn.value.reviewId, reviewId);
+  assert.equal(withdrawn.value.review.lifecycle, 'closed'); assert.equal(withdrawn.value.review.targets[0].status, 'withdrawn');
+  assert.equal(withdrawn.value.review.withdrawnAt, withdrawn.value.withdrawnAt);
+  assert.deepEqual(withdrawn.value.review, store.status(reviewId).reviews[0]);
+  assert.equal(store.list().reviews[0].right.text, candidate.files[0].text);
+  assert.deepEqual(await fs.readFile(target), original);
+  const withdrawnWait = await invoke(['wait', reviewId, '--timeout', '1']);
+  assert.equal(withdrawnWait.code, 0); assert.equal(withdrawnWait.value.reason, 'attention');
+  assert.deepEqual(withdrawnWait.value.reviews, [withdrawn.value.review]);
   // Direct store lifecycle operations stand in for a user's choices, isolated from the real app.
   await store.setReviewClosed(reviewId, true);
   const closed = await invoke(['status', reviewId]);
@@ -84,12 +98,16 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   assert.equal(attention.value.reviews[0].lifecycle, 'deleted');
   const duplicate = await invoke(['submit', '--file', candidatePath]);
   assert.equal(duplicate.code, 0); assert.deepEqual(duplicate.value, { reviewIds: [reviewId], duplicate: true });
+  const withdrawnDuplicate = await invoke(['withdraw', reviewId, '--request-id', candidate.requestId]);
+  assert.equal(withdrawnDuplicate.code, 0); assert.equal(withdrawnDuplicate.value.duplicate, true);
+  assert.equal(withdrawnDuplicate.value.withdrawnAt, withdrawn.value.withdrawnAt);
+  assert.equal(withdrawnDuplicate.value.review.lifecycle, 'deleted');
   assert.equal(store.list().reviews.length, 0); assert.equal(store.status(reviewId).reviews[0].lifecycle, 'deleted');
   const connectionsBeforeSave = connections;
   const refused = await invoke(['save', reviewId]);
   assert.equal(refused.code, 1); assert.equal(refused.value.code, 'CLI_HELPER_ERROR');
   assert.match(refused.value.error, /no CLI save or approval/); assert.equal(connections, connectionsBeforeSave);
-  assert.equal(submissions, 2); assert.deepEqual(await fs.readFile(target), original);
+  assert.equal(submissions, 1); assert.deepEqual(await fs.readFile(target), original);
   assert.deepEqual(await fs.readFile(candidatePath), candidateBytes);
   await assert.rejects(fs.stat(path.join(root, '.diffeditor-backups')), { code: 'ENOENT' });
 
@@ -97,7 +115,8 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   const savedPath = path.join(root, 'wait sample.txt'); await fs.writeFile(savedPath, 'before\r\n', { flag: 'wx' });
   const savedBaseline = await invoke(['baseline', savedPath]);
   const savedCandidatePath = path.join(root, 'wait candidate.json');
-  await fs.writeFile(savedCandidatePath, JSON.stringify({ requestId: randomUUID(), files: [{ baselineId: savedBaseline.value.files[0].id, text: 'AI version' }] }), { flag: 'wx' });
+  const savedCandidate = { requestId: randomUUID(), files: [{ baselineId: savedBaseline.value.files[0].id, text: 'AI version' }] };
+  await fs.writeFile(savedCandidatePath, JSON.stringify(savedCandidate), { flag: 'wx' });
   const savedSubmission = await invoke(['submit', '--file', savedCandidatePath]);
   const savedId = savedSubmission.value.reviewIds[0];
   let observed!: () => void;
@@ -106,16 +125,19 @@ test('AI skill helper submits through the real pipe without approving, writing, 
   store.onDidChange = listener => { const dispose = subscribe(listener); observed(); return dispose; };
   const waiting = invoke(['wait', savedId, '--timeout', '2']);
   await subscribed;
-  await store.updateDraft({ reviewId: savedId, side: 'left', text: 'user edited choice\n', expectedRevision: 0 });
-  const preview = await store.prepareSave({ reviewId: savedId, side: 'left', expectedRevision: 1 });
+  await store.updateDraft({ reviewId: savedId, side: 'right', text: 'user edited choice\n', expectedRevision: 0 });
+  const preview = await store.prepareSave({ reviewId: savedId, side: 'right', expectedRevision: 1 });
   const receipt = await store.commitSave(preview.token);
   const saved = await waiting;
   assert.equal(saved.code, 0); assert.equal(saved.stderr, ''); assert.equal(saved.value.reason, 'saved');
   assert.deepEqual(saved.value.reviews[0].targets[0].receipt, receipt);
-  assert.equal(receipt.side, 'left');
+  assert.equal(receipt.side, 'right');
   assert.equal(await fs.readFile(savedPath, 'utf8'), 'user edited choice\r\n');
   assert.equal(await fs.readFile(receipt.backupPath!, 'utf8'), 'before\r\n');
   const replay = await invoke(['wait', savedId, '--timeout', '1']);
   assert.deepEqual(replay.value, saved.value);
-  assert.equal(submissions, 3);
+  const savedWithdraw = await invoke(['withdraw', savedId, '--request-id', savedCandidate.requestId]);
+  assert.equal(savedWithdraw.code, 1); assert.equal(savedWithdraw.value.code, 'WITHDRAW_NOT_ALLOWED');
+  assert.deepEqual(store.status(savedId).reviews[0].targets[0].receipt, receipt);
+  assert.equal(submissions, 2);
 });

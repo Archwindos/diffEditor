@@ -1,6 +1,6 @@
 interface:
   display_name: "DiffEditor"
   short_description: "Review reading materials; skip code and internal progress logs"
-  default_prompt: "Use $diffeditor for my papers, explanations, notes, or other written material: create a new first draft directly, or submit revisions for review and wait for my UI save receipt."
+  default_prompt: "Use $diffeditor for my reading materials: create a new first draft directly, or iterate in a temporary draft and submit the accumulated result once for UI review, then wait for the save receipt."
 policy:
   allow_implicit_invocation: true

@@ -1,14 +1,16 @@
 import net from 'node:net';
 import { MAX_MESSAGE_BYTES } from '../shared/transport';
-import type { BaselineRequest, SubmitRequest, TextEncoding, WireReply } from '../shared/contracts';
-import type { ReviewStore } from '../core/store';
+import type { BaselineRequest, SubmitRequest, WithdrawRequest, WithdrawResponse, TextEncoding, WireReply } from '../shared/contracts';
+import { isReviewSource } from '../shared/contracts';
+import { ReviewError, type ReviewStore } from '../core/store';
 import { validateWaitRequest, waitForReviews } from './wait';
 const encodings: TextEncoding[] = ['utf8', 'utf16le', 'utf16be', 'gb18030'];
+export type BeforeWithdraw = (request: WithdrawRequest) => Promise<(result?: WithdrawResponse) => void>;
 export function failure(error: unknown): WireReply {
-  return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  return { ok: false, error: error instanceof Error ? error.message : String(error), ...(error instanceof ReviewError ? { code: error.code, reviewIds: error.reviewIds } : {}) };
 }
 export async function handleCli(store: ReviewStore, request: unknown, onSubmit: () => void,
-  waiting?: { signal: AbortSignal; onWait: () => void }): Promise<WireReply> {
+  waiting?: { signal: AbortSignal; onWait: () => void }, beforeWithdraw?: BeforeWithdraw): Promise<WireReply> {
   try {
     if (!request || typeof request !== 'object') throw new Error('请求必须为 JSON 对象');
     const { command, payload } = request as { command?: unknown; payload?: unknown };
@@ -22,10 +24,22 @@ export async function handleCli(store: ReviewStore, request: unknown, onSubmit: 
     if (command === 'submit') {
       if (typeof p.requestId !== 'string' || !p.requestId || !Array.isArray(p.files) || p.files.length === 0) throw new Error('提交需要 requestId 和 files');
       if (p.title !== undefined && typeof p.title !== 'string') throw new Error('title 必须为文本');
+      if (p.source !== undefined && !isReviewSource(p.source)) throw new Error('source 必须包含有效的 agent 及可选 threadId、threadTitle');
       if (p.files.some(f => !f || typeof f !== 'object' || typeof f.baselineId !== 'string' || typeof f.text !== 'string')) throw new Error('每个文件需要 baselineId 和 text');
       const result = await store.submit(p as unknown as SubmitRequest);
-      onSubmit();
+      if (!result.duplicate) onSubmit();
       return { ok: true, result };
+    }
+    if (command === 'withdraw') {
+      if (Array.isArray(payload) || Object.keys(p).some(key => !['reviewId', 'requestId', 'requireUnedited'].includes(key)) ||
+          typeof p.reviewId !== 'string' || !p.reviewId.trim() || typeof p.requestId !== 'string' || !p.requestId.trim() || p.requireUnedited !== true) throw new Error('撤回需要 reviewId、原提交 requestId 和 requireUnedited: true；请使用当前版本 CLI');
+      const input = p as unknown as WithdrawRequest;
+      let finish: ((result?: WithdrawResponse) => void) | undefined, result: WithdrawResponse | undefined;
+      try {
+        if (beforeWithdraw && await store.withdrawNeedsPreflight(input)) finish = await beforeWithdraw(input);
+        result = await store.withdraw(input);
+        return { ok: true, result };
+      } finally { finish?.(result); }
     }
     if (command === 'status') {
       if (p.reviewId !== undefined && typeof p.reviewId !== 'string') throw new Error('reviewId 必须为文本');
@@ -36,10 +50,10 @@ export async function handleCli(store: ReviewStore, request: unknown, onSubmit: 
       waiting?.onWait();
       return { ok: true, result: await waitForReviews(store, input, waiting?.signal) };
     }
-    throw new Error('CLI 仅支持 baseline、submit、status、wait；保存必须在桌面窗口中确认');
+    throw new Error('CLI 仅支持 baseline、submit、withdraw、status、wait；保存必须在桌面窗口中确认');
   } catch (error) { return failure(error); }
 }
-export function createPipeServer(store: ReviewStore, onSubmit: () => void): net.Server {
+export function createPipeServer(store: ReviewStore, onSubmit: () => void, beforeWithdraw?: BeforeWithdraw): net.Server {
   return net.createServer(socket => {
     const abort = new AbortController();
     socket.once('close', () => abort.abort());
@@ -66,7 +80,7 @@ export function createPipeServer(store: ReviewStore, onSubmit: () => void): net.
           signal: abort.signal,
           // Validated waits have their own bounded review deadline.
           onWait: () => socket.setTimeout(0),
-        }); }
+        }, beforeWithdraw); }
         catch (error) { reply = failure(error); }
         if (!socket.destroyed) socket.end(JSON.stringify(reply) + '\n');
       })();

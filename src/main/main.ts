@@ -7,6 +7,7 @@ import { createPipeServer, failure } from './server';
 import { pipeName } from '../shared/transport';
 import { SettingsStore } from './settings';
 import { createTrayIcon } from './tray-icon';
+import { WithdrawCoordinator } from './withdraw';
 import type { OpenFilesRequest, PrepareSaveRequest, TextEncoding, WireReply } from '../shared/contracts';
 
 const dataDir = process.env.DIFFEDITOR_DATA_DIR || path.join(process.env.LOCALAPPDATA || app.getPath('appData'), 'DiffEditor');
@@ -20,13 +21,14 @@ let allowClose = false;
 let closeRequested = false;
 let quitRequested = false;
 let tray: Tray | null = null;
-let rendererAvailable = true;
+let rendererAvailable = false;
 let recoveringRenderer = false;
 const settings = new SettingsStore(dataDir);
 const store = new ReviewStore({ dataDir: path.join(dataDir, 'drafts'), onChange: () => {
   if (win && !win.isDestroyed()) win.webContents.send('review:changed');
 } });
-const server = createPipeServer(store, restoreWindow);
+const withdrawals = new WithdrawCoordinator(() => win && !win.isDestroyed() && !win.webContents.isDestroyed() && rendererAvailable && !closeRequested ? win.webContents : undefined);
+const server = createPipeServer(store, restoreWindow, withdrawals.beforeWithdraw);
 
 function restoreWindow() {
   if (!win || win.isDestroyed()) createWindow();
@@ -75,7 +77,7 @@ function createTray() {
 function createWindow() {
   allowClose = false;
   closeRequested = false;
-  rendererAvailable = true;
+  rendererAvailable = false;
   win = new BrowserWindow({ width: 1440, height: 920, minWidth: 980, minHeight: 640,
     title: 'DiffEditor', backgroundColor: '#f3f5f5', show: true,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true,
@@ -100,16 +102,19 @@ function createWindow() {
     event.preventDefault();
     requestClose(true);
   });
-  win.on('closed', () => { win = null; });
+  const rendererId = win.webContents.id;
+  win.on('closed', () => { withdrawals.rendererGone(rendererId); rendererAvailable = false; win = null; });
+  win.webContents.on('did-start-loading', () => { rendererAvailable = false; withdrawals.rendererGone(rendererId); });
   win.webContents.on('did-finish-load', () => { rendererAvailable = true; });
   win.webContents.on('render-process-gone', () => {
+    withdrawals.rendererGone(rendererId);
     if (allowClose) return;
     rendererAvailable = false;
     void recoverRenderer();
   });
   void win.loadFile(path.join(__dirname, '../dist/index.html'));
 }
-function authorized(event: IpcMainInvokeEvent) {
+function authorized(event: Pick<IpcMainInvokeEvent, 'sender' | 'senderFrame'>) {
   if (!win || event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame) throw new Error('无效的桌面调用来源');
 }
 function handle(channel: string, fn: (...args: any[]) => unknown) {
@@ -160,6 +165,10 @@ function handlers() {
     const allowed = store.list().reviews.some(r => r.targets.some(t => t.path === filePath || t.receipt?.backupPath === filePath));
     if (!allowed) throw new Error('只能定位当前审阅中的文件或备份');
     shell.showItemInFolder(filePath);
+  });
+  ipcMain.on('review:withdraw-ready', (event, token, error) => {
+    try { authorized(event); withdrawals.ready(event.sender.id, token, error); }
+    catch { /* Untrusted frames cannot acknowledge a renderer draft flush. */ }
   });
   ipcMain.on('review:ready-close', event => {
     if (win && event.sender === win.webContents && event.senderFrame === win.webContents.mainFrame && closeRequested) {

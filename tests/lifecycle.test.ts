@@ -122,6 +122,7 @@ test('deletion removes text and tokens, preserves receipt metadata, disk and bac
   const submitted = await store.submit(request), reviewId = submitted.reviewIds[0];
   const preview = await store.prepareSave({ reviewId, side: 'right', expectedRevision: 0 }), receipt = await store.commitSave(preview.token);
   const disk = await fs.readFile(target), backup = await fs.readFile(receipt.backupPath!);
+  await store.setReviewClosed(reviewId, true);
   await store.deleteReview(reviewId); await store.deleteReview(reviewId);
   assert.deepEqual(store.list().reviews, []); const tombstone = store.status(reviewId).reviews[0];
   assert.equal(tombstone.lifecycle, 'deleted'); assert.deepEqual(tombstone.targets[0].receipt, receipt);
@@ -134,6 +135,37 @@ test('deletion removes text and tokens, preserves receipt metadata, disk and bac
   assert.deepEqual(await reloaded.submit(request), { reviewIds: [reviewId], duplicate: true }); assert.equal(reloaded.list().reviews.length, 0);
   assert.equal(reloaded.status(reviewId).reviews[0].lifecycle, 'deleted');
   await reloaded.openFiles({ paths: [target], mode: 'single' });
+});
+
+test('single deletion refuses open and reopened comparisons without changing drafts, cache or disk', async t => {
+  const { root, dataDir, store } = await fixture(t), target = path.join(root, 'open-delete.txt'); await fs.writeFile(target, 'original');
+  const review = (await store.openFiles({ paths: [target], mode: 'single' })).reviews[0];
+  await store.updateDraft({ reviewId: review.id, side: 'right', expectedRevision: 0, text: 'retained draft' });
+  const preview = await store.prepareSave({ reviewId: review.id, side: 'right', expectedRevision: 1 });
+  let before = store.list(), cache = await fs.readFile(path.join(dataDir, 'state.json'));
+  await assert.rejects(store.deleteReview(review.id), /先关闭后删除/);
+  assert.deepEqual(store.list(), before); assert.deepEqual(await fs.readFile(path.join(dataDir, 'state.json')), cache);
+  assert.equal(await fs.readFile(target, 'utf8'), 'original');
+  const state = JSON.parse(cache.toString('utf8')); assert.equal(state.plans[preview.token].phase, 'prepared');
+  await store.setReviewClosed(review.id, true); await store.setReviewClosed(review.id, false);
+  before = store.list(); cache = await fs.readFile(path.join(dataDir, 'state.json'));
+  await assert.rejects(store.deleteReview(review.id), /先关闭后删除/);
+  assert.deepEqual(store.list(), before); assert.deepEqual(await fs.readFile(path.join(dataDir, 'state.json')), cache);
+  await store.setReviewClosed(review.id, true); await store.deleteReview(review.id);
+  assert.equal(store.status(review.id).reviews[0].lifecycle, 'deleted'); assert.equal(await fs.readFile(target, 'utf8'), 'original');
+});
+
+test('failed single deletion cache write preserves the closed comparison for retry after restart', async t => {
+  const { dataDir, store } = await fixture(t), review = await store.createTextReview();
+  await store.updateDraft({ reviewId: review.id, side: 'right', expectedRevision: 0, text: 'retained' }); await store.setReviewClosed(review.id, true);
+  const before = store.list(), statePath = path.join(dataDir, 'state.json'), retained = path.join(dataDir, 'retained-state.json');
+  const cache = await fs.readFile(statePath);
+  await fs.rename(statePath, retained); await fs.mkdir(statePath);
+  try { await assert.rejects(store.deleteReview(review.id)); assert.deepEqual(store.list(), before); }
+  finally { await fs.rmdir(statePath); await fs.rename(retained, statePath); }
+  assert.deepEqual(await fs.readFile(statePath), cache);
+  const reloaded = new ReviewStore({ dataDir }); await reloaded.init(); assert.deepEqual(reloaded.list(), before);
+  await reloaded.deleteReview(review.id); assert.equal(reloaded.status(review.id).reviews[0].lifecycle, 'deleted');
 });
 
 test('bulk delete removes only confirmed still-closed comparisons and preserves files, receipts and replay history', async t => {
@@ -201,6 +233,7 @@ test('failed bulk cache write retains every comparison and permits a later retry
 test('deleting a pending blank comparison invalidates preview and never creates its destination', async t => {
   const { root, store } = await fixture(t), review = await store.createTextReview(), target = path.join(root, 'never-created.txt');
   const preview = await store.prepareSave({ reviewId: review.id, side: 'left', expectedRevision: 0, newPath: target });
+  await store.setReviewClosed(review.id, true);
   await store.deleteReview(review.id); await assert.rejects(store.commitSave(preview.token), /找不到保存预览/);
   await assert.rejects(fs.stat(target), { code: 'ENOENT' });
 });
@@ -211,8 +244,11 @@ test('old v1 state loads, and legacy submit payload survives conversion to a del
   const submitted = await store.submit(request), statePath = path.join(dataDir, 'state.json'), state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   delete state.deleted; state.requests[request.requestId] = { payload: JSON.stringify({ title: '', files: request.files }), reviewIds: submitted.reviewIds };
   await fs.writeFile(statePath, JSON.stringify(state)); const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
-  assert.equal((await reloaded.submit(request)).duplicate, true); await reloaded.deleteReview(submitted.reviewIds[0]);
+  const retry = { ...request, source: { agent: 'Codex', threadId: 'later-cli-origin' } };
+  assert.equal((await reloaded.submit(retry)).duplicate, true); assert.equal(reloaded.list().reviews[0].source, undefined);
+  await reloaded.setReviewClosed(submitted.reviewIds[0], true); await reloaded.deleteReview(submitted.reviewIds[0]);
   assert.equal((await reloaded.submit(request)).duplicate, true); assert.equal(reloaded.status().reviews[0].lifecycle, 'deleted');
+  assert.equal((await reloaded.submit(retry)).duplicate, true); assert.equal(reloaded.status().reviews[0].source, undefined);
 });
 
 test('unresolved journal blocks deletion until explicit disk continuation clears recovery references', async t => {
@@ -223,8 +259,10 @@ test('unresolved journal blocks deletion until explicit disk continuation clears
   const preview = await store.prepareSave({ reviewId: review.id, side: 'right', expectedRevision: 1 }); await assert.rejects(store.commitSave(preview.token), /interrupted/);
   await assert.rejects(store.rejectReview(review.id), /尚未核验/);
   assert.equal(store.status(review.id).reviews[0].targets[0].status, 'error');
+  await store.setReviewClosed(review.id, true);
   await assert.rejects(store.deleteReview(review.id), /尚未核验/);
-  await store.continueTarget(review.id, review.targets[0].id); await store.deleteReview(review.id);
+  await store.setReviewClosed(review.id, false); await store.continueTarget(review.id, review.targets[0].id);
+  await store.setReviewClosed(review.id, true); await store.deleteReview(review.id);
   const reloaded = new ReviewStore({ dataDir }); await reloaded.init();
   assert.equal(reloaded.status(review.id).reviews[0].lifecycle, 'deleted'); assert.equal(reloaded.list().reviews.length, 1);
   assert.equal(await fs.readFile(target, 'utf8'), 'replacement');

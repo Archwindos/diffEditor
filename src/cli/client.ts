@@ -5,16 +5,16 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { TextDecoder } from 'node:util';
 import type { CliRequest, SubmitRequest, TextEncoding, WireReply } from '../shared/contracts';
-import { DEFAULT_WAIT_MS, MAX_WAIT_MS } from '../shared/contracts';
+import { DEFAULT_WAIT_MS, MAX_WAIT_MS, isReviewSource } from '../shared/contracts';
 import { MAX_MESSAGE_BYTES, pipeName } from '../shared/transport';
 import { version } from '../../package.json';
 
 export class CliError extends Error {
-  constructor(message: string, public code = 'CLI_ERROR') { super(message); }
+  constructor(message: string, public code = 'CLI_ERROR', public reviewIds?: string[]) { super(message); }
 }
 
 const encodings = new Set<TextEncoding>(['utf8', 'utf16le', 'utf16be', 'gb18030']);
-const usage = 'Use baseline <paths...> [--encoding utf8|utf16le|utf16be|gb18030], submit --stdin|--file <json>, status [reviewId], or wait <reviewIds...> [--timeout seconds].';
+const usage = 'Use baseline <paths...> [--encoding utf8|utf16le|utf16be|gb18030], submit --stdin|--file <json>, withdraw <reviewId> --request-id <original-submit-requestId>, status [reviewId], or wait <reviewIds...> [--timeout seconds].';
 export function parseArgs(args: string[]): { request?: CliRequest; input?: 'stdin' | string } {
   const [command, ...rest] = args;
   if (command === 'baseline') {
@@ -39,6 +39,10 @@ export function parseArgs(args: string[]): { request?: CliRequest; input?: 'stdi
     if (rest.length === 1 && rest[0] === '--stdin') return { input: 'stdin' };
     if (rest.length === 2 && rest[0] === '--file' && rest[1] && !rest[1].startsWith('--')) return { input: path.resolve(rest[1]) };
     throw new CliError(usage, 'ARGUMENT_ERROR');
+  }
+  if (command === 'withdraw') {
+    if (rest.length !== 3 || !rest[0]?.trim() || rest[0].startsWith('--') || rest[1] !== '--request-id' || !rest[2]?.trim() || rest[2].startsWith('--')) throw new CliError(usage, 'ARGUMENT_ERROR');
+    return { request: { command, payload: { reviewId: rest[0], requestId: rest[2], requireUnedited: true } } };
   }
   if (command === 'status' && rest.length <= 1 && !rest[0]?.startsWith('--')) {
     return { request: { command, payload: rest.length ? { reviewId: rest[0] } : {} } };
@@ -77,17 +81,25 @@ export function parseSubmission(bytes: Buffer): SubmitRequest {
   if (!item || typeof item !== 'object' || Array.isArray(item) ||
     typeof item.requestId !== 'string' || !item.requestId.trim() ||
     (item.title !== undefined && typeof item.title !== 'string') ||
-    Object.keys(item).some(key => !['requestId', 'title', 'files'].includes(key)) ||
+    Object.keys(item).some(key => !['requestId', 'title', 'source', 'files'].includes(key)) ||
+    (item.source !== undefined && !isReviewSource(item.source)) ||
     !Array.isArray(item.files) || item.files.length === 0 || item.files.some(file =>
       !file || typeof file !== 'object' || Array.isArray(file) ||
       typeof file.baselineId !== 'string' || !file.baselineId.trim() || typeof file.text !== 'string' ||
       Object.keys(file).some(key => !['baselineId', 'text'].includes(key)))) {
-    throw new CliError('Expected {requestId, title?, files:[{baselineId, text}]} with at least one file.', 'INVALID_SUBMISSION');
+    throw new CliError('Expected {requestId, title?, source?:{agent, threadId?, threadTitle?}, files:[{baselineId, text}]} with at least one file and valid source metadata.', 'INVALID_SUBMISSION');
   }
   if (new Set(item.files.map(file => file.baselineId)).size !== item.files.length) {
     throw new CliError('Submission contains repeated baselineId values.', 'INVALID_SUBMISSION');
   }
   return item;
+}
+
+export function withSubmissionSource(request: SubmitRequest, env: NodeJS.ProcessEnv = process.env): SubmitRequest {
+  const source = { ...(request.source ?? { agent: 'Codex' }) };
+  if (source.threadId === undefined && env.CODEX_THREAD_ID) source.threadId = env.CODEX_THREAD_ID;
+  if (!isReviewSource(source)) throw new CliError('Source metadata is invalid or exceeds its length limits.', 'INVALID_SUBMISSION');
+  return { ...request, source };
 }
 
 export async function readInput(input: string, timeoutMs: number): Promise<Buffer> {
@@ -221,7 +233,8 @@ export async function sendRequest(request: CliRequest, timeoutMs = 20_000): Prom
         if (!reply || typeof reply !== 'object' || typeof reply.ok !== 'boolean') throw new CliError('Malformed response envelope.', 'INVALID_RESPONSE');
         if (!reply.ok) {
           if (typeof reply.error !== 'string') throw new CliError('Malformed error response.', 'INVALID_RESPONSE');
-          finish(new CliError(reply.error, typeof reply.code === 'string' ? reply.code : 'APP_ERROR'));
+          if (reply.reviewIds !== undefined && (!Array.isArray(reply.reviewIds) || reply.reviewIds.some(id => typeof id !== 'string'))) throw new CliError('Malformed review IDs in error response.', 'INVALID_RESPONSE');
+          finish(new CliError(reply.error, typeof reply.code === 'string' ? reply.code : 'APP_ERROR', reply.reviewIds));
         } else if (!Object.hasOwn(reply, 'result')) throw new CliError('Missing response result.', 'INVALID_RESPONSE');
         else finish(undefined, reply.result);
       } catch (error) { finish(error instanceof CliError ? error : new CliError('Response is not valid JSON.', 'INVALID_RESPONSE')); }

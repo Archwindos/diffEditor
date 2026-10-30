@@ -8,8 +8,8 @@ import sys
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("baseline", "submit", "status", "wait"):
-        raise ValueError("Only baseline, submit, status, and wait are supported; no CLI save or approval exists.")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("baseline", "submit", "status", "wait", "withdraw"):
+        raise ValueError("Only baseline, submit, status, wait, and withdraw are supported; no CLI save or approval exists.")
     explicit = os.environ.get("DIFFEDITOR_HOME")
     roots = [Path(explicit)] if explicit else [Path(__file__).resolve().parents[3], Path(r"D:\Project\diffEditor")]
     for root in roots:
@@ -34,7 +34,12 @@ def main():
         else:
             continue
         # Inherit cwd so relative target/input paths retain the caller's meaning.
-        return subprocess.run(command + sys.argv[1:], env=env, shell=False).returncode
+        # Explicit standard handles are required for the Windows GUI-subsystem
+        # Electron executable; implicit inheritance can silently discard JSON.
+        return subprocess.run(
+            command + sys.argv[1:], env=env, shell=False,
+            stdin=sys.stdin.buffer, stdout=sys.stdout.buffer, stderr=sys.stderr.buffer,
+        ).returncode
     raise FileNotFoundError("DiffEditor CLI not found or not built. Set DIFFEDITOR_HOME to the installation directory.")
 
 

@@ -31,5 +31,16 @@ const api: DesktopAPI = {
   onSaveShortcut: callback => listen('review:save-shortcut', callback),
   onBeforeClose: callback => listen('review:before-close', callback),
   readyToClose: () => ipcRenderer.send('review:ready-close'),
+  onBeforeWithdraw: callback => {
+    const handler = (_event: unknown, request: Parameters<typeof callback>[0]) => callback(request);
+    ipcRenderer.on('review:before-withdraw', handler);
+    return () => ipcRenderer.removeListener('review:before-withdraw', handler);
+  },
+  withdrawReady: (token, error) => ipcRenderer.send('review:withdraw-ready', token, error),
+  onWithdrawFinished: callback => {
+    const handler = (_event: unknown, result: Parameters<typeof callback>[0]) => callback(result);
+    ipcRenderer.on('review:withdraw-finished', handler);
+    return () => ipcRenderer.removeListener('review:withdraw-finished', handler);
+  },
 };
 contextBridge.exposeInMainWorld('diffEditor', api);

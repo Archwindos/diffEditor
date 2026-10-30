@@ -35,7 +35,7 @@ export function waitForReviews(store: ReviewStore, request: WaitRequest, signal?
         const reviews = request.reviewIds.map(id => store.status(id).reviews[0]);
         const reason = reviews.every(saved) ? 'saved' : reviews.some(review => !saved(review) &&
           (review.lifecycle === 'closed' || review.lifecycle === 'deleted' ||
-            review.targets.some(t => ['error', 'conflict', 'rejected'].includes(t.status)))) ? 'attention' : timedOut ? 'timeout' : undefined;
+            review.withdrawnAt || review.targets.some(t => ['error', 'conflict', 'rejected', 'withdrawn'].includes(t.status)))) ? 'attention' : timedOut ? 'timeout' : undefined;
         if (reason) finish(undefined, { reason, reviews });
       } catch (error) { finish(error); }
     };
